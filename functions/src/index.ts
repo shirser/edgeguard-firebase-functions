@@ -67,9 +67,17 @@ export const sendNotificationOnCreate = onDocumentCreated(
           type: String(data.type ?? ""),
           cameraDeviceId: String(cameraDeviceId),
           eventId: String(eventId),
+          title: String(title),
+          body: String(body),
         },
         android: {
           priority: "high",
+          notification: {
+            channelId: "edgeguard_alerts_v1",
+            priority: "high",
+            defaultSound: true,
+            defaultVibrateTimings: true,
+          },
         },
       });
 
