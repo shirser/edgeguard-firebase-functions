@@ -1,8 +1,89 @@
 import { onDocumentCreated } from "firebase-functions/v2/firestore";
+import { onValueWritten } from "firebase-functions/v2/database";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 
 admin.initializeApp();
+
+export const enqueueCameraStatusNotification = onValueWritten(
+  {
+    ref: "cameraStatus/{cameraDeviceId}",
+    region: "europe-west1",
+  },
+  async (event) => {
+    const { cameraDeviceId } = event.params;
+    const before = event.data.before.val();
+    const after = event.data.after.val();
+
+    const beforeConnectionState: string = before?.connectionState ?? "";
+    const afterConnectionState: string = after?.connectionState ?? "";
+    const beforeAppState: string = before?.appState ?? "";
+    const afterAppState: string = after?.appState ?? "";
+
+    const isAppClosed =
+      beforeAppState === "running" && afterAppState === "stopped";
+
+    const isOffline =
+      beforeConnectionState === "connected" &&
+      afterConnectionState === "disconnected" &&
+      afterAppState !== "stopped";
+
+    if (!isAppClosed && !isOffline) {
+      logger.info("CAMERA_STATUS_SKIP", {
+        cameraDeviceId,
+        beforeAppState,
+        afterAppState,
+        beforeConnectionState,
+        afterConnectionState,
+      });
+      return;
+    }
+
+    const db = admin.firestore();
+
+    if (isOffline) {
+      logger.info("CAMERA_OFFLINE_DETECTED", { cameraDeviceId });
+
+      const offlineRef = db
+        .collection("cameraLinks")
+        .doc(cameraDeviceId)
+        .collection("notificationQueue")
+        .doc();
+
+      await offlineRef.set({
+        type: "camera_offline",
+        title: "Camera offline",
+        body: "Your Camera connection was lost.",
+        status: "pending",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      logger.info("CAMERA_OFFLINE_QUEUE_CREATED", { eventId: offlineRef.id });
+    }
+
+    if (isAppClosed) {
+      logger.info("CAMERA_APP_CLOSED_DETECTED", { cameraDeviceId });
+
+      const appClosedRef = db
+        .collection("cameraLinks")
+        .doc(cameraDeviceId)
+        .collection("notificationQueue")
+        .doc();
+
+      await appClosedRef.set({
+        type: "camera_app_closed",
+        title: "Camera app was closed",
+        body: "Your Camera app was closed.",
+        status: "pending",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      logger.info("CAMERA_APP_CLOSED_QUEUE_CREATED", {
+        eventId: appClosedRef.id,
+      });
+    }
+  }
+);
 
 export const sendNotificationOnCreate = onDocumentCreated(
   {
