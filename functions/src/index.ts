@@ -189,6 +189,11 @@ export const claimCameraForUser = onCall(
     const cameraDeviceRef = userRef
       .collection("cameraDevices")
       .doc(cameraDeviceId);
+    const pairingStateRef = db
+      .collection("cameraLinks")
+      .doc(cameraDeviceId)
+      .collection("pairingState")
+      .doc("current");
 
     const secretHash = hashSecret(pairingSecret);
 
@@ -283,8 +288,18 @@ export const claimCameraForUser = onCall(
         consumedByUid: uid,
       });
 
+      t.set(pairingStateRef, {
+        status: "paired",
+        cameraDeviceId,
+        homeDeviceId,
+        pairedAt: now,
+        pairedByUid: uid,
+      });
+
       return { cameraCount: newCameraCount, cameraLimit };
     });
+
+    logger.info("CLAIM_CAMERA_PAIRING_STATE_WRITTEN", { cameraDeviceId });
 
     logger.info("CLAIM_CAMERA_SUCCESS", {
       uid,
