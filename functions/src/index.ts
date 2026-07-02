@@ -337,6 +337,11 @@ export const releaseCameraForUser = onCall(
     const cameraDeviceRef = userRef
       .collection("cameraDevices")
       .doc(cameraDeviceId);
+    const pairingStateRef = db
+      .collection("cameraLinks")
+      .doc(cameraDeviceId)
+      .collection("pairingState")
+      .doc("current");
 
     await db.runTransaction(async (t) => {
       const [claimSnap, userSnap] = await Promise.all([
@@ -352,6 +357,8 @@ export const releaseCameraForUser = onCall(
         (userSnap.get("subscriptionUnits") as number) ?? 0;
       const cameraLimit = 1 + subscriptionUnits * 5;
 
+      const now = admin.firestore.FieldValue.serverTimestamp();
+
       t.delete(claimRef);
       t.delete(cameraDeviceRef);
 
@@ -359,10 +366,19 @@ export const releaseCameraForUser = onCall(
         t.update(userRef, {
           cameraCount: admin.firestore.FieldValue.increment(-1),
           cameraLimit,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: now,
         });
       }
+
+      t.set(pairingStateRef, {
+        status: "unpaired",
+        cameraDeviceId,
+        unpairedAt: now,
+        unpairedByUid: uid,
+      });
     });
+
+    logger.info("RELEASE_CAMERA_PAIRING_STATE_WRITTEN", { cameraDeviceId });
 
     logger.info("RELEASE_CAMERA_SUCCESS", { uid, cameraDeviceId });
 
