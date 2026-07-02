@@ -1,9 +1,359 @@
 import { onDocumentCreated } from "firebase-functions/v2/firestore";
 import { onValueWritten } from "firebase-functions/v2/database";
+import { onCall, HttpsError } from "firebase-functions/v2/https";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
+import * as crypto from "crypto";
 
 admin.initializeApp();
+
+function hashSecret(secret: string): string {
+  return crypto.createHash("sha256").update(secret).digest("hex");
+}
+
+async function isNotificationEnabled(
+  cameraDeviceId: string,
+  type: string
+): Promise<boolean> {
+  logger.info("FUNCTION_NOTIFICATION_SETTING_CHECK", { cameraDeviceId, type });
+  try {
+    const snap = await admin
+      .firestore()
+      .collection("cameraLinks")
+      .doc(cameraDeviceId)
+      .collection("notificationSettings")
+      .doc(type)
+      .get();
+
+    if (!snap.exists) {
+      logger.info("FUNCTION_NOTIFICATION_SETTING_MISSING_DEFAULT_TRUE", {
+        cameraDeviceId,
+        type,
+      });
+      return true;
+    }
+
+    const enabled = snap.get("enabled");
+    const result = enabled !== false;
+
+    logger.info("FUNCTION_NOTIFICATION_SETTING_ENABLED", {
+      cameraDeviceId,
+      type,
+      enabled: result,
+    });
+
+    return result;
+  } catch (error: any) {
+    logger.error("FUNCTION_NOTIFICATION_SETTING_ERROR_DEFAULT_TRUE", {
+      cameraDeviceId,
+      type,
+      error: error?.message ?? String(error),
+    });
+    return true;
+  }
+}
+
+async function handleCameraEvent(
+  db: admin.firestore.Firestore,
+  cameraDeviceId: string,
+  type: string,
+  title: string,
+  body: string,
+  severity: string
+): Promise<void> {
+  const pushEnabled = await isNotificationEnabled(cameraDeviceId, type);
+
+  let pushQueued = false;
+
+  if (pushEnabled) {
+    const queueRef = db
+      .collection("cameraLinks")
+      .doc(cameraDeviceId)
+      .collection("notificationQueue")
+      .doc();
+
+    await queueRef.set({
+      type,
+      title,
+      body,
+      status: "pending",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    pushQueued = true;
+    logger.info("NOTIFICATION_QUEUE_CREATED", {
+      cameraDeviceId,
+      type,
+      eventId: queueRef.id,
+    });
+  } else {
+    logger.info("FUNCTION_NOTIFICATION_SETTING_SKIP", {
+      cameraDeviceId,
+      type,
+      enabled: false,
+    });
+  }
+
+  const activityRef = db
+    .collection("cameraLinks")
+    .doc(cameraDeviceId)
+    .collection("activityEvents")
+    .doc();
+
+  await activityRef.set({
+    type,
+    title,
+    body,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    source: "function",
+    severity,
+    pushEnabled,
+    pushQueued,
+  });
+
+  logger.info("ACTIVITY_EVENT_CREATED", {
+    cameraDeviceId,
+    type,
+    eventId: activityRef.id,
+    pushEnabled,
+    pushQueued,
+  });
+}
+
+export const createCameraPairingSession = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+
+    const { cameraDeviceId, pairingSecretHash } = request.data as {
+      cameraDeviceId?: string;
+      pairingSecretHash?: string;
+    };
+
+    if (!cameraDeviceId || !pairingSecretHash) {
+      throw new HttpsError("invalid-argument", "INVALID_PAIRING");
+    }
+
+    logger.info("CREATE_PAIRING_SESSION_START", { cameraDeviceId });
+
+    const db = admin.firestore();
+    const pairingRef = db.collection("cameraPairingSessions").doc();
+    const pairingId = pairingRef.id;
+    const expiresAt = admin.firestore.Timestamp.fromMillis(
+      Date.now() + 10 * 60 * 1000
+    );
+
+    await pairingRef.set({
+      cameraDeviceId,
+      pairingSecretHash,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt,
+      consumedAt: null,
+      status: "pending",
+    });
+
+    logger.info("CREATE_PAIRING_SESSION_SUCCESS", { pairingId });
+
+    return { pairingId, expiresAt: expiresAt.toDate().toISOString() };
+  }
+);
+
+export const claimCameraForUser = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+
+    const uid = request.auth.uid;
+    const { cameraDeviceId, pairingId, pairingSecret, homeDeviceId } =
+      request.data as {
+        cameraDeviceId?: string;
+        pairingId?: string;
+        pairingSecret?: string;
+        homeDeviceId?: string;
+      };
+
+    if (!cameraDeviceId || !pairingId || !pairingSecret || !homeDeviceId) {
+      throw new HttpsError("invalid-argument", "INVALID_PAIRING");
+    }
+
+    logger.info("CLAIM_CAMERA_START", { uid, cameraDeviceId, pairingId });
+
+    const db = admin.firestore();
+    const userRef = db.collection("users").doc(uid);
+    const claimRef = db.collection("cameraClaims").doc(cameraDeviceId);
+    const pairingRef = db.collection("cameraPairingSessions").doc(pairingId);
+    const cameraDeviceRef = userRef
+      .collection("cameraDevices")
+      .doc(cameraDeviceId);
+
+    const secretHash = hashSecret(pairingSecret);
+
+    const txResult = await db.runTransaction(async (t) => {
+      const [userSnap, claimSnap, pairingSnap] = await Promise.all([
+        t.get(userRef),
+        t.get(claimRef),
+        t.get(pairingRef),
+      ]);
+
+      // Validate pairing session
+      const sessionExpiresAt = pairingSnap.get(
+        "expiresAt"
+      ) as admin.firestore.Timestamp | undefined;
+
+      const pairingValid =
+        pairingSnap.exists &&
+        pairingSnap.get("status") === "pending" &&
+        !pairingSnap.get("consumedAt") &&
+        sessionExpiresAt != null &&
+        sessionExpiresAt.toMillis() > Date.now() &&
+        pairingSnap.get("cameraDeviceId") === cameraDeviceId &&
+        pairingSnap.get("pairingSecretHash") === secretHash;
+
+      if (!pairingValid) {
+        logger.info("CLAIM_CAMERA_INVALID_PAIRING", { cameraDeviceId, pairingId });
+        throw new HttpsError("failed-precondition", "INVALID_PAIRING");
+      }
+
+      // Idempotent: already claimed by this user
+      if (claimSnap.exists) {
+        const claimedUid = claimSnap.get("uid") as string;
+        if (claimedUid === uid) {
+          const subscriptionUnits: number =
+            (userSnap.get("subscriptionUnits") as number) ?? 0;
+          return {
+            cameraCount: (userSnap.get("cameraCount") as number) ?? 0,
+            cameraLimit: 1 + subscriptionUnits * 5,
+          };
+        }
+        logger.info("CLAIM_CAMERA_ALREADY_CLAIMED", { cameraDeviceId });
+        throw new HttpsError("failed-precondition", "CAMERA_ALREADY_CLAIMED");
+      }
+
+      const subscriptionUnits: number = userSnap.exists
+        ? ((userSnap.get("subscriptionUnits") as number) ?? 0)
+        : 0;
+      const cameraCount: number = userSnap.exists
+        ? ((userSnap.get("cameraCount") as number) ?? 0)
+        : 0;
+      const cameraLimit = 1 + subscriptionUnits * 5;
+
+      if (cameraCount >= cameraLimit) {
+        logger.info("CLAIM_CAMERA_LIMIT_REACHED", { uid, cameraCount, cameraLimit });
+        throw new HttpsError("failed-precondition", "CAMERA_LIMIT_REACHED");
+      }
+
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      const newCameraCount = cameraCount + 1;
+
+      if (!userSnap.exists) {
+        t.set(userRef, {
+          subscriptionUnits: 0,
+          cameraLimit,
+          cameraCount: newCameraCount,
+          createdAt: now,
+          updatedAt: now,
+        });
+      } else {
+        t.update(userRef, {
+          cameraCount: admin.firestore.FieldValue.increment(1),
+          cameraLimit,
+          updatedAt: now,
+        });
+      }
+
+      t.set(cameraDeviceRef, {
+        cameraDeviceId,
+        homeDeviceId,
+        pairedAt: now,
+        status: "active",
+      });
+
+      t.set(claimRef, {
+        uid,
+        claimedAt: now,
+      });
+
+      t.update(pairingRef, {
+        status: "consumed",
+        consumedAt: now,
+        consumedByUid: uid,
+      });
+
+      return { cameraCount: newCameraCount, cameraLimit };
+    });
+
+    logger.info("CLAIM_CAMERA_SUCCESS", {
+      uid,
+      cameraCount: txResult.cameraCount,
+      cameraLimit: txResult.cameraLimit,
+    });
+
+    return {
+      success: true,
+      cameraLimit: txResult.cameraLimit,
+      cameraCount: txResult.cameraCount,
+    };
+  }
+);
+
+export const releaseCameraForUser = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+
+    const uid = request.auth.uid;
+    const { cameraDeviceId } = request.data as { cameraDeviceId?: string };
+
+    if (!cameraDeviceId) {
+      throw new HttpsError("invalid-argument", "INVALID_PAIRING");
+    }
+
+    logger.info("RELEASE_CAMERA_START", { uid, cameraDeviceId });
+
+    const db = admin.firestore();
+    const userRef = db.collection("users").doc(uid);
+    const claimRef = db.collection("cameraClaims").doc(cameraDeviceId);
+    const cameraDeviceRef = userRef
+      .collection("cameraDevices")
+      .doc(cameraDeviceId);
+
+    await db.runTransaction(async (t) => {
+      const [claimSnap, userSnap] = await Promise.all([
+        t.get(claimRef),
+        t.get(userRef),
+      ]);
+
+      if (!claimSnap.exists || (claimSnap.get("uid") as string) !== uid) {
+        throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+      }
+
+      const subscriptionUnits: number =
+        (userSnap.get("subscriptionUnits") as number) ?? 0;
+      const cameraLimit = 1 + subscriptionUnits * 5;
+
+      t.delete(claimRef);
+      t.delete(cameraDeviceRef);
+
+      if (userSnap.exists) {
+        t.update(userRef, {
+          cameraCount: admin.firestore.FieldValue.increment(-1),
+          cameraLimit,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    });
+
+    logger.info("RELEASE_CAMERA_SUCCESS", { uid, cameraDeviceId });
+
+    return { success: true };
+  }
+);
 
 export const enqueueCameraStatusNotification = onValueWritten(
   {
@@ -43,44 +393,26 @@ export const enqueueCameraStatusNotification = onValueWritten(
 
     if (isOffline) {
       logger.info("CAMERA_OFFLINE_DETECTED", { cameraDeviceId });
-
-      const offlineRef = db
-        .collection("cameraLinks")
-        .doc(cameraDeviceId)
-        .collection("notificationQueue")
-        .doc();
-
-      await offlineRef.set({
-        type: "camera_offline",
-        title: "Camera offline",
-        body: "Your Camera connection was lost.",
-        status: "pending",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      logger.info("CAMERA_OFFLINE_QUEUE_CREATED", { eventId: offlineRef.id });
+      await handleCameraEvent(
+        db,
+        cameraDeviceId,
+        "camera_offline",
+        "Camera offline",
+        "Your Camera connection was lost.",
+        "warning"
+      );
     }
 
     if (isAppClosed) {
       logger.info("CAMERA_APP_CLOSED_DETECTED", { cameraDeviceId });
-
-      const appClosedRef = db
-        .collection("cameraLinks")
-        .doc(cameraDeviceId)
-        .collection("notificationQueue")
-        .doc();
-
-      await appClosedRef.set({
-        type: "camera_app_closed",
-        title: "Camera app was closed",
-        body: "Your Camera app was closed.",
-        status: "pending",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      logger.info("CAMERA_APP_CLOSED_QUEUE_CREATED", {
-        eventId: appClosedRef.id,
-      });
+      await handleCameraEvent(
+        db,
+        cameraDeviceId,
+        "camera_app_closed",
+        "Camera app was closed",
+        "Your Camera app was closed.",
+        "warning"
+      );
     }
   }
 );
