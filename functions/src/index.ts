@@ -148,6 +148,7 @@ export const createCameraPairingSession = onCall(
     await pairingRef.set({
       cameraDeviceId,
       pairingSecretHash,
+      cameraAuthUid: request.auth.uid,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       expiresAt,
       consumedAt: null,
@@ -227,11 +228,35 @@ export const claimCameraForUser = onCall(
       if (claimSnap.exists) {
         const claimedUid = claimSnap.get("uid") as string;
         if (claimedUid === uid) {
+          logger.info("CLAIM_CAMERA_IDEMPOTENT_OWNER", { cameraDeviceId });
+
+          const idempotentNow = admin.firestore.FieldValue.serverTimestamp();
+
+          logger.info("CLAIM_CAMERA_PAIRING_STATE_WRITE_START", {
+            cameraDeviceId,
+            path: `cameraLinks/${cameraDeviceId}/pairingState/current`,
+          });
+
+          t.set(
+            pairingStateRef,
+            {
+              status: "paired",
+              cameraDeviceId,
+              homeDeviceId,
+              pairedAt: idempotentNow,
+              pairedByUid: uid,
+            },
+            { merge: true }
+          );
+
+          logger.info("CLAIM_CAMERA_PAIRING_STATE_WRITE_QUEUED", { cameraDeviceId });
+
           const subscriptionUnits: number =
             (userSnap.get("subscriptionUnits") as number) ?? 0;
           return {
             cameraCount: (userSnap.get("cameraCount") as number) ?? 0,
             cameraLimit: 1 + subscriptionUnits * 5,
+            pairingStateWritten: true,
           };
         }
         logger.info("CLAIM_CAMERA_ALREADY_CLAIMED", { cameraDeviceId });
@@ -277,8 +302,13 @@ export const claimCameraForUser = onCall(
         status: "active",
       });
 
+      const cameraAuthUid = pairingSnap.get("cameraAuthUid") as
+        | string
+        | undefined;
+
       t.set(claimRef, {
         uid,
+        cameraAuthUid: cameraAuthUid ?? null,
         claimedAt: now,
       });
 
@@ -286,6 +316,11 @@ export const claimCameraForUser = onCall(
         status: "consumed",
         consumedAt: now,
         consumedByUid: uid,
+      });
+
+      logger.info("CLAIM_CAMERA_PAIRING_STATE_WRITE_START", {
+        cameraDeviceId,
+        path: `cameraLinks/${cameraDeviceId}/pairingState/current`,
       });
 
       t.set(pairingStateRef, {
@@ -296,10 +331,31 @@ export const claimCameraForUser = onCall(
         pairedByUid: uid,
       });
 
-      return { cameraCount: newCameraCount, cameraLimit };
+      logger.info("CLAIM_CAMERA_PAIRING_STATE_WRITE_QUEUED", { cameraDeviceId });
+
+      return { cameraCount: newCameraCount, cameraLimit, pairingStateWritten: true };
     });
 
-    logger.info("CLAIM_CAMERA_PAIRING_STATE_WRITTEN", { cameraDeviceId });
+    logger.info("CLAIM_CAMERA_TRANSACTION_DONE", {
+      cameraDeviceId,
+      pairingStateWritten: txResult.pairingStateWritten,
+    });
+
+    if (txResult.pairingStateWritten) {
+      logger.info("CLAIM_CAMERA_PAIRING_STATE_WRITTEN", { cameraDeviceId });
+    }
+
+    const pairingStateSnap = await pairingStateRef.get();
+
+    logger.info("CLAIM_CAMERA_PAIRING_STATE_VERIFY", {
+      cameraDeviceId,
+      exists: pairingStateSnap.exists,
+      status: pairingStateSnap.get("status") ?? null,
+    });
+
+    if (!pairingStateSnap.exists) {
+      logger.error("CLAIM_CAMERA_PAIRING_STATE_MISSING_AFTER_SUCCESS", { cameraDeviceId });
+    }
 
     logger.info("CLAIM_CAMERA_SUCCESS", {
       uid,
@@ -383,6 +439,198 @@ export const releaseCameraForUser = onCall(
     logger.info("RELEASE_CAMERA_SUCCESS", { uid, cameraDeviceId });
 
     return { success: true };
+  }
+);
+
+// Called by the Camera App itself (e.g. "Unpair camera" in-app) to release its own pairing.
+// The Camera App authenticates anonymously and has no relationship to the Home account's uid,
+// so — like createCameraPairingSession/claimCameraForUser — authorization here is based on
+// possession of cameraDeviceId (a locally generated, never-guessable UUID) plus being any
+// authenticated Firebase user, rather than an owner-uid check.
+export const unpairCameraFromDevice = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+
+    const { cameraDeviceId } = request.data as { cameraDeviceId?: string };
+
+    if (!cameraDeviceId) {
+      throw new HttpsError("invalid-argument", "INVALID_PAIRING");
+    }
+
+    logger.info("UNPAIR_CAMERA_FROM_DEVICE_START", { cameraDeviceId });
+
+    const db = admin.firestore();
+    const claimRef = db.collection("cameraClaims").doc(cameraDeviceId);
+    const pairingStateRef = db
+      .collection("cameraLinks")
+      .doc(cameraDeviceId)
+      .collection("pairingState")
+      .doc("current");
+
+    await db.runTransaction(async (t) => {
+      const claimSnap = await t.get(claimRef);
+
+      if (!claimSnap.exists) {
+        logger.info("UNPAIR_CAMERA_FROM_DEVICE_NOT_CLAIMED", { cameraDeviceId });
+        return;
+      }
+
+      const ownerUid = claimSnap.get("uid") as string;
+      const userRef = db.collection("users").doc(ownerUid);
+      const cameraDeviceRef = userRef.collection("cameraDevices").doc(cameraDeviceId);
+      const userSnap = await t.get(userRef);
+
+      const now = admin.firestore.FieldValue.serverTimestamp();
+
+      t.delete(claimRef);
+      t.delete(cameraDeviceRef);
+
+      if (userSnap.exists) {
+        const subscriptionUnits: number =
+          (userSnap.get("subscriptionUnits") as number) ?? 0;
+        const cameraLimit = 1 + subscriptionUnits * 5;
+        t.update(userRef, {
+          cameraCount: admin.firestore.FieldValue.increment(-1),
+          cameraLimit,
+          updatedAt: now,
+        });
+      }
+
+      t.set(pairingStateRef, {
+        status: "unpaired",
+        cameraDeviceId,
+        unpairedAt: now,
+        unpairedByUid: request.auth!.uid,
+        unpairedBy: "camera",
+      });
+    });
+
+    logger.info("UNPAIR_CAMERA_FROM_DEVICE_SUCCESS", { cameraDeviceId });
+
+    return { success: true };
+  }
+);
+
+// Called by the Camera App to release its own pairing, proving ownership via the
+// cameraAuthUid recorded on cameraClaims at claim time (copied from the pairing session's
+// cameraAuthUid, itself set from the Camera App's anonymous auth uid in
+// createCameraPairingSession). Unlike unpairCameraFromDevice, this verifies the caller is
+// the same Camera App identity that was originally claimed, not just any authenticated user.
+export const releaseCameraFromCamera = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+
+    const cameraAuthUid = request.auth.uid;
+    const { cameraDeviceId } = request.data as { cameraDeviceId?: string };
+
+    if (!cameraDeviceId) {
+      throw new HttpsError("invalid-argument", "INVALID_PAIRING");
+    }
+
+    logger.info("RELEASE_CAMERA_FROM_CAMERA_START", { cameraDeviceId });
+
+    const db = admin.firestore();
+    const claimRef = db.collection("cameraClaims").doc(cameraDeviceId);
+    const pairingStateRef = db
+      .collection("cameraLinks")
+      .doc(cameraDeviceId)
+      .collection("pairingState")
+      .doc("current");
+
+    try {
+      const ownerUid = await db.runTransaction(async (t) => {
+        const claimSnap = await t.get(claimRef);
+
+        const claimCameraAuthUid = claimSnap.get("cameraAuthUid") as
+          | string
+          | undefined;
+        const cameraAuthUidMatches =
+          claimSnap.exists && claimCameraAuthUid === cameraAuthUid;
+
+        logger.info("RELEASE_CAMERA_FROM_CAMERA_AUTH_CHECK", {
+          cameraDeviceId,
+          cameraAuthUidMatches,
+        });
+
+        if (!cameraAuthUidMatches) {
+          throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+        }
+
+        const ownerUid = claimSnap.get("uid") as string;
+        const userRef = db.collection("users").doc(ownerUid);
+        const cameraDeviceRef = userRef
+          .collection("cameraDevices")
+          .doc(cameraDeviceId);
+
+        const [userSnap, cameraDeviceSnap, pairingStateSnap] = await Promise.all([
+          t.get(userRef),
+          t.get(cameraDeviceRef),
+          t.get(pairingStateRef),
+        ]);
+
+        logger.info("RELEASE_CAMERA_FROM_CAMERA_READ", {
+          cameraDeviceId,
+          ownerUid,
+          cameraDeviceExists: cameraDeviceSnap.exists,
+          previousPairingStatus: pairingStateSnap.get("status") ?? null,
+        });
+
+        const now = admin.firestore.FieldValue.serverTimestamp();
+
+        t.delete(claimRef);
+        t.delete(cameraDeviceRef);
+
+        if (userSnap.exists) {
+          const subscriptionUnits: number =
+            (userSnap.get("subscriptionUnits") as number) ?? 0;
+          const cameraCount: number =
+            (userSnap.get("cameraCount") as number) ?? 0;
+          const newCameraCount = Math.max(0, cameraCount - 1);
+          const cameraLimit = 1 + subscriptionUnits * 5;
+
+          t.update(userRef, {
+            cameraCount: newCameraCount,
+            cameraLimit,
+            updatedAt: now,
+          });
+        }
+
+        t.set(pairingStateRef, {
+          status: "unpaired",
+          cameraDeviceId,
+          unpairedAt: now,
+          unpairedBy: "camera",
+          unpairedByCameraAuthUid: cameraAuthUid,
+          previousOwnerUid: ownerUid,
+        });
+
+        return ownerUid;
+      });
+
+      logger.info("RELEASE_CAMERA_FROM_CAMERA_PAIRING_STATE_WRITTEN", {
+        cameraDeviceId,
+      });
+
+      logger.info("RELEASE_CAMERA_FROM_CAMERA_SUCCESS", {
+        cameraDeviceId,
+        ownerUid,
+      });
+
+      return { success: true };
+    } catch (error: any) {
+      logger.error("RELEASE_CAMERA_FROM_CAMERA_FAILED", {
+        cameraDeviceId,
+        errorClass: error?.constructor?.name ?? "Error",
+        message: error?.message ?? String(error),
+      });
+      throw error;
+    }
   }
 );
 
