@@ -38,6 +38,16 @@ export async function seedDoc(testEnv, path, data) {
   });
 }
 
+// Same as seedDoc but merges onto any existing document instead of replacing
+// it — mirrors createCameraPairingSession's `{ merge: true }` write onto
+// pairingState/current, which only touches cameraAuthUid/pairingRequestedAt
+// and leaves any pre-existing fields (e.g. a stale status:"unpaired") intact.
+export async function mergeDoc(testEnv, path, data) {
+  await testEnv.withSecurityRulesDisabled(async (ctx) => {
+    await setDoc(doc(ctx.firestore(), ...path), data, { merge: true });
+  });
+}
+
 // Exact command shape Home App writes on create (DeleteCameraScreen.kt) —
 // UNPAIR is the only type/status value the client ever produces.
 export function validCommand(overrides = {}) {

@@ -470,6 +470,20 @@ export const releaseCameraForUser = onCall(
         throw new HttpsError("permission-denied", "PERMISSION_DENIED");
       }
 
+      // Read the linked Camera's auth uid before the claim is deleted below.
+      // Without this, the pairingState write after release has no
+      // cameraAuthUid, and since cameraClaims is gone in this same
+      // transaction, firestore.rules' isLinkedIdentity() check also fails —
+      // the Camera's pairingState listener (its fallback for detecting a
+      // server-side unpair, see MainActivity.kt) gets permission-denied
+      // instead of the status:"unpaired" update, and never clears its local
+      // paired state. Carrying cameraAuthUid forward lets the rule's
+      // `resource.data.cameraAuthUid == request.auth.uid` branch admit the
+      // very Camera identity that was just unlinked.
+      const cameraAuthUid = claimSnap.get("cameraAuthUid") as
+        | string
+        | undefined;
+
       const subscriptionUnits: number =
         (userSnap.get("subscriptionUnits") as number) ?? 0;
       const cameraLimit = 1 + subscriptionUnits * 5;
@@ -490,8 +504,10 @@ export const releaseCameraForUser = onCall(
       t.set(pairingStateRef, {
         status: "unpaired",
         cameraDeviceId,
+        cameraAuthUid: cameraAuthUid ?? null,
         unpairedAt: now,
         unpairedByUid: uid,
+        unpairedBy: "home",
       });
     });
 

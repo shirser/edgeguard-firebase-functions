@@ -7,6 +7,7 @@ import {
   createTestEnv,
   seedClaim,
   seedDoc,
+  mergeDoc,
   validCommand,
   homeDb,
   cameraDb,
@@ -306,6 +307,89 @@ describe("Pre-claim pairing (no cameraClaims yet)", () => {
   it("another authenticated uid cannot read it", async () => {
     await assertFails(
       getDoc(doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "pairingState", "current"))
+    );
+  });
+});
+
+describe("Post-unpair pairingState (former Camera fallback listener)", () => {
+  // Mirrors the state releaseCameraForUser now leaves behind: cameraClaims is
+  // gone (so isLinkedIdentity() can no longer vouch for anyone), but
+  // pairingState/current carries the old cameraAuthUid forward alongside
+  // status:"unpaired" — this is exactly what lets the Camera's pairingState
+  // listener (MainActivity.kt's fallback for a server-side unpair) still
+  // read the doc and clear its local paired state.
+  beforeEach(() =>
+    seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "pairingState", "current"], {
+      status: "unpaired",
+      cameraDeviceId: CAMERA_ID,
+      cameraAuthUid: CAMERA_UID,
+      unpairedAt: new Date(),
+      unpairedByUid: "home-owner-uid",
+      unpairedBy: "home",
+    })
+  );
+
+  it("the former linked Camera can read pairingState (status=unpaired) via its own cameraAuthUid", async () => {
+    const snap = await assertSucceeds(
+      getDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "pairingState", "current"))
+    );
+    if (snap.data().status !== "unpaired") {
+      throw new Error("expected status to be unpaired");
+    }
+  });
+
+  it("a stranger cannot read it", async () => {
+    await assertFails(
+      getDoc(doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "pairingState", "current"))
+    );
+  });
+
+  it("the former Camera does not regain access to other subcollections", async () => {
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "commands", "cmd1"], validCommand());
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "activityEvents", "evt1"], {
+      type: "camera_offline",
+    });
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "notificationTarget", "home"], {
+      fcmToken: "home-fcm-token",
+    });
+
+    await assertFails(
+      getDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "commands", "cmd1"))
+    );
+    await assertFails(
+      getDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "activityEvents", "evt1"))
+    );
+    await assertFails(
+      getDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "notificationTarget", "home"))
+    );
+  });
+
+  it("a fresh pairing session's cameraAuthUid correctly replaces the stale one", async () => {
+    const NEW_CAMERA_UID = "new-camera-auth-uid";
+
+    // Simulates createCameraPairingSession's guarded merge write: cameraClaims
+    // still doesn't exist, so the function overwrites cameraAuthUid with the
+    // new pairing attempt's own uid (merge, not replace — the stale
+    // status:"unpaired" doc from beforeEach is exactly what's being merged onto).
+    await mergeDoc(testEnv, ["cameraLinks", CAMERA_ID, "pairingState", "current"], {
+      cameraDeviceId: CAMERA_ID,
+      cameraAuthUid: NEW_CAMERA_UID,
+      pairingRequestedAt: new Date(),
+    });
+
+    await assertFails(
+      getDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "pairingState", "current"))
+    );
+    await assertSucceeds(
+      getDoc(
+        doc(
+          testEnv.authenticatedContext(NEW_CAMERA_UID).firestore(),
+          "cameraLinks",
+          CAMERA_ID,
+          "pairingState",
+          "current"
+        )
+      )
     );
   });
 });
