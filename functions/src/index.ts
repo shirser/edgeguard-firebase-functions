@@ -120,6 +120,13 @@ async function handleCameraEvent(
   });
 }
 
+// NOTE: consumed/expired cameraPairingSessions documents are never deleted
+// today, so this collection grows unbounded. Recommend adding a scheduled
+// (e.g. daily) cleanup function that deletes documents where
+// `status != "pending"` or `expiresAt < now`. Not implemented here since it
+// is out of scope for this security pass — no client can read/write this
+// collection (see firestore.rules), so the growth is a cost/hygiene concern,
+// not a security one.
 export const createCameraPairingSession = onCall(
   { region: "europe-west1" },
   async (request) => {
@@ -154,6 +161,32 @@ export const createCameraPairingSession = onCall(
       consumedAt: null,
       status: "pending",
     });
+
+    // Record the initiating Camera's own auth uid on pairingState/current so
+    // Firestore rules can let this same Camera identity read its own
+    // pairingState before any cameraClaims doc exists (first-listener case,
+    // before Home finishes claimCameraForUser). Only written pre-claim: if
+    // the device is already claimed, claimCameraForUser's own (non-merge)
+    // writes to this doc are the sole source of truth, and we must not let
+    // a fresh pairing session hijack read access to an already-paired
+    // camera's pairingState by overwriting cameraAuthUid here.
+    const claimSnap = await db.collection("cameraClaims").doc(cameraDeviceId).get();
+    if (!claimSnap.exists) {
+      const pairingStateRef = db
+        .collection("cameraLinks")
+        .doc(cameraDeviceId)
+        .collection("pairingState")
+        .doc("current");
+
+      await pairingStateRef.set(
+        {
+          cameraDeviceId,
+          cameraAuthUid: request.auth.uid,
+          pairingRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
 
     logger.info("CREATE_PAIRING_SESSION_SUCCESS", { pairingId });
 
@@ -266,15 +299,43 @@ export const claimCameraForUser = onCall(
       const subscriptionUnits: number = userSnap.exists
         ? ((userSnap.get("subscriptionUnits") as number) ?? 0)
         : 0;
-      const cameraCount: number = userSnap.exists
+      const currentCameraCount: number = userSnap.exists
         ? ((userSnap.get("cameraCount") as number) ?? 0)
         : 0;
-      const cameraLimit = 1 + subscriptionUnits * 5;
+      const allowedCameraCount = 1 + subscriptionUnits * 5;
+      const nextCameraCount = currentCameraCount + 1;
 
-      if (cameraCount >= cameraLimit) {
-        logger.info("CLAIM_CAMERA_LIMIT_REACHED", { uid, cameraCount, cameraLimit });
-        throw new HttpsError("failed-precondition", "CAMERA_LIMIT_REACHED");
+      logger.info("CAMERA_LIMIT_CHECK", {
+        uid,
+        cameraDeviceId,
+        currentCameraCount,
+        nextCameraCount,
+        subscriptionUnits,
+        allowedCameraCount,
+      });
+
+      if (nextCameraCount > allowedCameraCount) {
+        logger.info("CAMERA_LIMIT_REACHED", {
+          uid,
+          cameraDeviceId,
+          currentCameraCount,
+          nextCameraCount,
+          subscriptionUnits,
+          allowedCameraCount,
+        });
+        throw new HttpsError("resource-exhausted", "Camera limit reached", {
+          code: "CAMERA_LIMIT_REACHED",
+          currentCameraCount,
+          nextCameraCount,
+          allowedCameraCount,
+          subscriptionUnits,
+        });
       }
+
+      logger.info("CAMERA_LIMIT_OK", { uid, cameraDeviceId, nextCameraCount });
+
+      const cameraCount = currentCameraCount;
+      const cameraLimit = allowedCameraCount;
 
       const now = admin.firestore.FieldValue.serverTimestamp();
       const newCameraCount = cameraCount + 1;
@@ -443,10 +504,12 @@ export const releaseCameraForUser = onCall(
 );
 
 // Called by the Camera App itself (e.g. "Unpair camera" in-app) to release its own pairing.
-// The Camera App authenticates anonymously and has no relationship to the Home account's uid,
-// so — like createCameraPairingSession/claimCameraForUser — authorization here is based on
-// possession of cameraDeviceId (a locally generated, never-guessable UUID) plus being any
-// authenticated Firebase user, rather than an owner-uid check.
+// Authorization requires the caller to be the linked Camera identity
+// (cameraAuthUid on the claim) — mirroring releaseCameraFromCamera's check —
+// so arbitrary authenticated users can no longer unpair a camera by knowing
+// only its cameraDeviceId. Unlike releaseCameraFromCamera, this is a no-op
+// (not an error) if the camera is already unclaimed, which is the one
+// intentional behavioral difference between the two functions.
 export const unpairCameraFromDevice = onCall(
   { region: "europe-west1" },
   async (request) => {
@@ -454,6 +517,7 @@ export const unpairCameraFromDevice = onCall(
       throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
     }
 
+    const callerUid = request.auth.uid;
     const { cameraDeviceId } = request.data as { cameraDeviceId?: string };
 
     if (!cameraDeviceId) {
@@ -479,6 +543,17 @@ export const unpairCameraFromDevice = onCall(
       }
 
       const ownerUid = claimSnap.get("uid") as string;
+      const linkedCameraAuthUid = claimSnap.get("cameraAuthUid") as
+        | string
+        | undefined;
+
+      if (callerUid !== linkedCameraAuthUid) {
+        logger.info("UNPAIR_CAMERA_FROM_DEVICE_PERMISSION_DENIED", {
+          cameraDeviceId,
+        });
+        throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+      }
+
       const userRef = db.collection("users").doc(ownerUid);
       const cameraDeviceRef = userRef.collection("cameraDevices").doc(cameraDeviceId);
       const userSnap = await t.get(userRef);
@@ -631,6 +706,72 @@ export const releaseCameraFromCamera = onCall(
       });
       throw error;
     }
+  }
+);
+
+const ALLOWED_CAMERA_EVENT_SEVERITIES = new Set(["info", "warning", "critical"]);
+
+// Called by the Camera App to report an event (e.g. motion detected) that
+// should be recorded as an activity event and, if enabled, queued for push
+// notification. Replaces direct client writes to
+// cameraLinks/{cameraDeviceId}/activityEvents and .../notificationQueue,
+// both of which are function-only in firestore.rules — notificationQueue in
+// particular must never be client-writable, since sendNotificationOnCreate
+// fires on any document created there. Authorization mirrors
+// releaseCameraFromCamera: the caller must be the cameraAuthUid linked to
+// this cameraDeviceId in cameraClaims. Reuses handleCameraEvent so the
+// notification-enabled/queue/activity-event logic isn't duplicated.
+export const submitCameraEvent = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+
+    const { cameraDeviceId, type, title, body, severity } = request.data as {
+      cameraDeviceId?: string;
+      type?: string;
+      title?: string;
+      body?: string;
+      severity?: string;
+    };
+
+    if (
+      typeof cameraDeviceId !== "string" ||
+      !cameraDeviceId ||
+      typeof type !== "string" ||
+      !type ||
+      type.length > 64 ||
+      typeof title !== "string" ||
+      !title ||
+      title.length > 200 ||
+      typeof body !== "string" ||
+      !body ||
+      body.length > 2000 ||
+      typeof severity !== "string" ||
+      !ALLOWED_CAMERA_EVENT_SEVERITIES.has(severity)
+    ) {
+      throw new HttpsError("invalid-argument", "INVALID_EVENT");
+    }
+
+    logger.info("SUBMIT_CAMERA_EVENT_START", { cameraDeviceId, type, severity });
+
+    const db = admin.firestore();
+    const claimSnap = await db.collection("cameraClaims").doc(cameraDeviceId).get();
+    const linkedCameraAuthUid = claimSnap.get("cameraAuthUid") as
+      | string
+      | undefined;
+
+    if (!claimSnap.exists || linkedCameraAuthUid !== request.auth.uid) {
+      logger.info("SUBMIT_CAMERA_EVENT_PERMISSION_DENIED", { cameraDeviceId });
+      throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+    }
+
+    await handleCameraEvent(db, cameraDeviceId, type, title, body, severity);
+
+    logger.info("SUBMIT_CAMERA_EVENT_SUCCESS", { cameraDeviceId, type });
+
+    return { success: true };
   }
 );
 

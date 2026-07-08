@@ -2,6 +2,38 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // Ownership lookup: cameraClaims/{cameraDeviceId} is function-written only
+    // (see match block below) but rules may still `get()`/`exists()` it to
+    // scope access on other collections to the linked Home (uid) and/or
+    // linked Camera (cameraAuthUid) identities.
+    function claimPath(cameraDeviceId) {
+      return /databases/$(database)/documents/cameraClaims/$(cameraDeviceId);
+    }
+
+    function claimExists(cameraDeviceId) {
+      return exists(claimPath(cameraDeviceId));
+    }
+
+    function claimData(cameraDeviceId) {
+      return get(claimPath(cameraDeviceId)).data;
+    }
+
+    function isOwnerUid(cameraDeviceId) {
+      return request.auth != null &&
+        claimExists(cameraDeviceId) &&
+        request.auth.uid == claimData(cameraDeviceId).uid;
+    }
+
+    function isCameraUid(cameraDeviceId) {
+      return request.auth != null &&
+        claimExists(cameraDeviceId) &&
+        request.auth.uid == claimData(cameraDeviceId).cameraAuthUid;
+    }
+
+    function isLinkedIdentity(cameraDeviceId) {
+      return isOwnerUid(cameraDeviceId) || isCameraUid(cameraDeviceId);
+    }
+
     // users: own user can read; all writes go through Functions (admin SDK)
     match /users/{uid} {
       allow read: if request.auth != null && request.auth.uid == uid;
@@ -13,30 +45,111 @@ service cloud.firestore {
       }
     }
 
-    // cameraClaims: Functions (admin SDK) only — no client access
+    // cameraClaims: Functions (admin SDK) only — no client access.
+    // Still readable from within rules via get()/exists() above (that bypasses
+    // these allow rules) to power ownership checks elsewhere.
     match /cameraClaims/{cameraDeviceId} {
       allow read, write: if false;
     }
 
-    // cameraPairingSessions: Functions (admin SDK) only — no client access
-    // Clients never read sessions; all validation happens server-side in claimCameraForUser
+    // cameraPairingSessions: Functions (admin SDK) only — no client access.
+    // Clients never read sessions; all validation happens server-side in
+    // createCameraPairingSession/claimCameraForUser.
     match /cameraPairingSessions/{pairingId} {
       allow read, write: if false;
     }
 
-    // cameraLinks: camera and home apps read/write their own data
+    // cameraLinks: only the linked Home (uid) or linked Camera (cameraAuthUid)
+    // identity for that specific cameraDeviceId — never "any authenticated user".
     match /cameraLinks/{cameraDeviceId} {
-      allow read, write: if request.auth != null;
+      allow read: if isLinkedIdentity(cameraDeviceId);
 
-      // pairingState: written only by claimCameraForUser via Admin SDK.
-      // Clients (Camera App) may read it to detect pairing completion but never write it.
+      // Parent doc: written by the Home App's ensureParentDocument() as
+      // convenience metadata. No Cloud Function reads this document (only
+      // its subcollections, which don't require a parent doc to exist), so
+      // this is a client-only, non-authoritative mirror. Restrict to the
+      // linked Home owner and to exactly the fields the Home App writes, so
+      // it can't be used to smuggle arbitrary data onto this path. Assumes
+      // ensureParentDocument() runs after claimCameraForUser has succeeded
+      // (cameraClaims must already exist) — if the Home App calls it earlier
+      // in the pairing flow, this write will be denied and the app needs to
+      // sequence it after claim success instead.
+      allow create, update: if isOwnerUid(cameraDeviceId) &&
+        request.resource.data.keys().hasOnly(["cameraDeviceId", "homeDeviceId", "updatedAt"]) &&
+        request.resource.data.cameraDeviceId == cameraDeviceId;
+      allow delete: if false;
+
+      // pairingState: written only by createCameraPairingSession (pre-claim
+      // ownership field only) and claimCameraForUser/releaseCamera*
+      // functions (post-claim state) via Admin SDK — never by clients.
+      // Clients may read it to detect pairing completion/unpair:
+      //  - Pre-claim (no cameraClaims doc yet): only the Camera identity
+      //    that itself called createCameraPairingSession may read, proven by
+      //    matching request.auth.uid against the cameraAuthUid the function
+      //    recorded on this same doc at session-creation time — not by mere
+      //    knowledge of cameraDeviceId.
+      //  - Post-claim: either linked identity (Home owner or Camera) via
+      //    cameraClaims, same as every other subcollection here.
       match /pairingState/{document} {
-        allow read: if request.auth != null;
+        allow read: if request.auth != null &&
+          (
+            isLinkedIdentity(cameraDeviceId) ||
+            (resource != null && resource.data.cameraAuthUid == request.auth.uid)
+          );
         allow write: if false;
       }
 
-      match /{subcollection}/{document} {
-        allow read, write: if request.auth != null && subcollection != "pairingState";
+      // commands: Home creates commands for its linked Camera to execute;
+      // Camera reads pending commands and updates them (e.g. to record
+      // completion). Neither role may act once cameraClaims no longer
+      // exists (e.g. immediately after unpair), since isOwnerUid/isCameraUid
+      // both depend on that claim doc still being present.
+      match /commands/{commandId} {
+        allow read: if isLinkedIdentity(cameraDeviceId);
+        allow create: if isOwnerUid(cameraDeviceId);
+        allow update: if isCameraUid(cameraDeviceId);
+        allow delete: if isOwnerUid(cameraDeviceId);
+      }
+
+      // notificationSettings: Home-owner preference toggles (e.g. mute a
+      // notification type). Only the linked Home may read/write its own.
+      match /notificationSettings/{type} {
+        allow read, write: if isOwnerUid(cameraDeviceId);
+      }
+
+      // notificationQueue: function-only. Clients (including the linked
+      // Camera) must never create these documents directly —
+      // sendNotificationOnCreate fires on any document created here, so
+      // allowing client writes would let anyone spoof a push notification.
+      // The Camera App reports events via the submitCameraEvent callable
+      // instead, which writes here server-side (Admin SDK bypasses these
+      // rules) through the same handleCameraEvent logic used by
+      // enqueueCameraStatusNotification.
+      match /notificationQueue/{eventId} {
+        allow read, write: if false;
+      }
+
+      // notificationTarget: holds the Home's FCM token (`home` doc). Only
+      // the linked Home identity may read or write its own token — this
+      // must never be readable by other authenticated users or writable by
+      // the linked Camera.
+      match /notificationTarget/{document} {
+        allow read, write: if isOwnerUid(cameraDeviceId);
+      }
+
+      // activityEvents: function-written activity feed (via handleCameraEvent,
+      // called from enqueueCameraStatusNotification and submitCameraEvent).
+      // Either linked identity may read; the Camera no longer writes here
+      // directly — only functions (Admin SDK) may write.
+      match /activityEvents/{eventId} {
+        allow read: if isLinkedIdentity(cameraDeviceId);
+        allow write: if false;
+      }
+
+      // Deny any other/future subcollection by default (least privilege)
+      // instead of the previous catch-all "any authenticated user" rule.
+      match /{subcollection}/{document=**} {
+        allow read, write: if false;
       }
     }
   }
