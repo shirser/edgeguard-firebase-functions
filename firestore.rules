@@ -104,10 +104,38 @@ service cloud.firestore {
       // completion). Neither role may act once cameraClaims no longer
       // exists (e.g. immediately after unpair), since isOwnerUid/isCameraUid
       // both depend on that claim doc still being present.
+      //
+      // Field contract below is taken from the actual client code, not
+      // invented:
+      //  - Home App (DeleteCameraScreen.kt) creates exactly one command
+      //    shape: {type: "UNPAIR", status: "pending", createdAt, createdBy,
+      //    homeDeviceId, cameraDeviceId} — no other type/status value or
+      //    field is ever written on create.
+      //  - Camera App (PairingFirestoreManager.completeCommand) only ever
+      //    calls .update("status", "completed", "completedAt", <server ts>)
+      //    — no other field or status transition is ever performed.
       match /commands/{commandId} {
         allow read: if isLinkedIdentity(cameraDeviceId);
-        allow create: if isOwnerUid(cameraDeviceId);
-        allow update: if isCameraUid(cameraDeviceId);
+
+        allow create: if isOwnerUid(cameraDeviceId) &&
+          request.resource.data.keys().hasOnly([
+            "type", "status", "createdAt", "createdBy", "homeDeviceId", "cameraDeviceId"
+          ]) &&
+          request.resource.data.type == "UNPAIR" &&
+          request.resource.data.status == "pending" &&
+          request.resource.data.createdBy == request.auth.uid &&
+          request.resource.data.cameraDeviceId == cameraDeviceId &&
+          request.resource.data.homeDeviceId is string;
+
+        // Camera may only flip status pending -> completed and stamp
+        // completedAt; every other field (type, createdBy, createdAt,
+        // homeDeviceId, cameraDeviceId) is immutable from the Camera's side,
+        // and no new field may be introduced.
+        allow update: if isCameraUid(cameraDeviceId) &&
+          resource.data.status == "pending" &&
+          request.resource.data.status == "completed" &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "completedAt"]);
+
         allow delete: if isOwnerUid(cameraDeviceId);
       }
 

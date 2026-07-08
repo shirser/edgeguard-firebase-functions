@@ -1,0 +1,12 @@
+{
+  "name": "edgeguard-firebase-rules-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:rules": "firebase emulators:exec --only firestore --project demo-edgeguard-rules-test \"node --test firestore-tests/*.test.js\""
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.1",
+    "firebase": "^12.5.0"
+  }
+}
