@@ -853,6 +853,138 @@ export const enqueueCameraStatusNotification = onValueWritten(
   }
 );
 
+// FCM error codes that mean the token itself is permanently dead — the
+// device/app was uninstalled or the token was rotated/revoked server-side.
+// Only these two trigger token cleanup. Every other code (including the
+// transient ones called out below) is deliberately NOT in this set, so
+// cleanup fails safe/closed: an unrecognized or future error code never
+// deletes a token, only these two explicitly known-dead codes do.
+//
+// Transient FCM errors that must NOT clear the token (kept only as
+// documentation of intent — they already fall through untouched since
+// they're absent from the set above): messaging/internal-error,
+// messaging/server-unavailable, messaging/quota-exceeded (and the
+// rate-exceeded variants), messaging/third-party-auth-error.
+const FCM_TOKEN_DEAD_ERROR_CODES = new Set([
+  "messaging/registration-token-not-registered",
+  "messaging/invalid-registration-token",
+]);
+
+// Extracted from the onDocumentCreated handler so it can be exercised by
+// unit tests against the Firestore emulator with a fake sendMessage — real
+// admin.messaging().send() calls require production FCM connectivity.
+export async function sendCameraNotification(
+  db: admin.firestore.Firestore,
+  cameraDeviceId: string,
+  eventId: string,
+  data: FirebaseFirestore.DocumentData,
+  queueRef: admin.firestore.DocumentReference,
+  sendMessage: (message: admin.messaging.Message) => Promise<string> = (message) =>
+    admin.messaging().send(message)
+): Promise<void> {
+  if (data.status !== "pending") {
+    logger.info("Skip non-pending notification", {
+      cameraDeviceId,
+      eventId,
+      status: data.status,
+    });
+    return;
+  }
+
+  const title = data.title;
+  const body = data.body;
+
+  if (!title || !body) {
+    await queueRef.update({
+      status: "failed",
+      error: "Missing title or body",
+      failedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return;
+  }
+
+  const targetRef = db
+    .collection("cameraLinks")
+    .doc(cameraDeviceId)
+    .collection("notificationTarget")
+    .doc("home");
+
+  const targetSnap = await targetRef.get();
+  const fcmToken = targetSnap.get("fcmToken");
+
+  if (!fcmToken) {
+    await queueRef.update({
+      status: "failed",
+      error: "Missing Home FCM token",
+      failedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return;
+  }
+
+  try {
+    const messageId = await sendMessage({
+      token: fcmToken,
+      notification: {
+        title,
+        body,
+      },
+      data: {
+        type: String(data.type ?? ""),
+        cameraDeviceId: String(cameraDeviceId),
+        eventId: String(eventId),
+        title: String(title),
+        body: String(body),
+      },
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "edgeguard_alerts_v1",
+          priority: "high",
+          defaultSound: true,
+          defaultVibrateTimings: true,
+        },
+      },
+    });
+
+    await queueRef.update({
+      status: "sent",
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      messageId,
+    });
+
+    logger.info("Push sent", { cameraDeviceId, eventId, messageId });
+  } catch (error: any) {
+    const errorCode = error?.code as string | undefined;
+
+    await queueRef.update({
+      status: "failed",
+      error: error?.message ?? String(error),
+      failedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    logger.error("Push failed", { cameraDeviceId, eventId, errorCode });
+
+    if (!errorCode || !FCM_TOKEN_DEAD_ERROR_CODES.has(errorCode)) {
+      return;
+    }
+
+    // Re-read before deleting: Home may have saved a new token for this
+    // camera in the time between the send attempt and this cleanup, and
+    // that new token must never be clobbered by a failure tied to the old one.
+    const currentTargetSnap = await targetRef.get();
+    const currentToken = currentTargetSnap.get("fcmToken");
+
+    if (currentTargetSnap.exists && currentToken === fcmToken) {
+      await targetRef.update({
+        fcmToken: admin.firestore.FieldValue.delete(),
+      });
+      logger.info("FCM_TOKEN_REMOVED_INVALID", { cameraDeviceId, errorCode });
+    } else {
+      logger.info("FCM_TOKEN_CHANGED_SKIP_DELETE", { cameraDeviceId, errorCode });
+    }
+  }
+}
+
 export const sendNotificationOnCreate = onDocumentCreated(
   {
     document: "cameraLinks/{cameraDeviceId}/notificationQueue/{eventId}",
@@ -862,89 +994,14 @@ export const sendNotificationOnCreate = onDocumentCreated(
     const snapshot = event.data;
     if (!snapshot) return;
 
-    const data = snapshot.data();
     const { cameraDeviceId, eventId } = event.params;
 
-    if (data.status !== "pending") {
-      logger.info("Skip non-pending notification", {
-        cameraDeviceId,
-        eventId,
-        status: data.status,
-      });
-      return;
-    }
-
-    const title = data.title;
-    const body = data.body;
-
-    if (!title || !body) {
-      await snapshot.ref.update({
-        status: "failed",
-        error: "Missing title or body",
-        failedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      return;
-    }
-
-    const targetSnap = await admin
-      .firestore()
-      .collection("cameraLinks")
-      .doc(cameraDeviceId)
-      .collection("notificationTarget")
-      .doc("home")
-      .get();
-
-    const fcmToken = targetSnap.get("fcmToken");
-
-    if (!fcmToken) {
-      await snapshot.ref.update({
-        status: "failed",
-        error: "Missing Home FCM token",
-        failedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      return;
-    }
-
-    try {
-      const messageId = await admin.messaging().send({
-        token: fcmToken,
-        notification: {
-          title,
-          body,
-        },
-        data: {
-          type: String(data.type ?? ""),
-          cameraDeviceId: String(cameraDeviceId),
-          eventId: String(eventId),
-          title: String(title),
-          body: String(body),
-        },
-        android: {
-          priority: "high",
-          notification: {
-            channelId: "edgeguard_alerts_v1",
-            priority: "high",
-            defaultSound: true,
-            defaultVibrateTimings: true,
-          },
-        },
-      });
-
-      await snapshot.ref.update({
-        status: "sent",
-        sentAt: admin.firestore.FieldValue.serverTimestamp(),
-        messageId,
-      });
-
-      logger.info("Push sent", { cameraDeviceId, eventId, messageId });
-    } catch (error: any) {
-      await snapshot.ref.update({
-        status: "failed",
-        error: error?.message ?? String(error),
-        failedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      logger.error("Push failed", { cameraDeviceId, eventId, error });
-    }
+    await sendCameraNotification(
+      admin.firestore(),
+      cameraDeviceId,
+      eventId,
+      snapshot.data(),
+      snapshot.ref
+    );
   }
 );

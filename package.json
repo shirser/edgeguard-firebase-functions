@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:rules": "firebase emulators:exec --only firestore --project demo-edgeguard-rules-test \"node --test firestore-tests/*.test.js\""
+    "test:rules": "firebase emulators:exec --only firestore --project demo-edgeguard-rules-test \"node --test firestore-tests/*.test.js\"",
+    "test:functions": "bash scripts/test-functions.sh",
+    "test": "npm run test:rules && npm run test:functions"
   },
   "devDependencies": {
     "@firebase/rules-unit-testing": "^5.0.1",
