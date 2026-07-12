@@ -432,6 +432,78 @@ export const claimCameraForUser = onCall(
   }
 );
 
+export const updateCameraNameForUser = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+
+    const uid = request.auth.uid;
+    const { cameraDeviceId, cameraName } = request.data as {
+      cameraDeviceId?: string;
+      cameraName?: string;
+    };
+
+    if (typeof cameraDeviceId !== "string" || cameraDeviceId.length === 0) {
+      throw new HttpsError("invalid-argument", "INVALID_CAMERA_DEVICE_ID");
+    }
+
+    if (typeof cameraName !== "string") {
+      throw new HttpsError("invalid-argument", "INVALID_CAMERA_NAME");
+    }
+
+    const trimmedCameraName = cameraName.trim();
+    if (trimmedCameraName.length === 0 || trimmedCameraName.length > 50) {
+      throw new HttpsError("invalid-argument", "INVALID_CAMERA_NAME");
+    }
+
+    logger.info("UPDATE_CAMERA_NAME_START", { uid, cameraDeviceId });
+
+    const db = admin.firestore();
+    const claimRef = db.collection("cameraClaims").doc(cameraDeviceId);
+    const pairingStateRef = db
+      .collection("cameraLinks")
+      .doc(cameraDeviceId)
+      .collection("pairingState")
+      .doc("current");
+    const cameraDeviceRef = db
+      .collection("users")
+      .doc(uid)
+      .collection("cameraDevices")
+      .doc(cameraDeviceId);
+
+    await db.runTransaction(async (t) => {
+      const claimSnap = await t.get(claimRef);
+
+      if (!claimSnap.exists) {
+        logger.info("UPDATE_CAMERA_NAME_NOT_FOUND", { cameraDeviceId });
+        throw new HttpsError("not-found", "CAMERA_NOT_FOUND");
+      }
+
+      if ((claimSnap.get("uid") as string) !== uid) {
+        logger.info("UPDATE_CAMERA_NAME_PERMISSION_DENIED", { cameraDeviceId });
+        throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+      }
+
+      t.set(
+        pairingStateRef,
+        { cameraName: trimmedCameraName },
+        { merge: true }
+      );
+      t.set(
+        cameraDeviceRef,
+        { cameraName: trimmedCameraName },
+        { merge: true }
+      );
+    });
+
+    logger.info("UPDATE_CAMERA_NAME_SUCCESS", { uid, cameraDeviceId });
+
+    return { success: true, cameraName: trimmedCameraName };
+  }
+);
+
 export const releaseCameraForUser = onCall(
   { region: "europe-west1" },
   async (request) => {
