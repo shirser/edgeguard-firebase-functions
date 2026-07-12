@@ -433,7 +433,7 @@ export const claimCameraForUser = onCall(
 );
 
 export const updateCameraNameForUser = onCall(
-  { region: "europe-west1" },
+  { region: "europe-west1", invoker: "public" },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
