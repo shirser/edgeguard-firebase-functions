@@ -107,10 +107,11 @@ service cloud.firestore {
       //
       // Field contract below is taken from the actual client code, not
       // invented:
-      //  - Home App (DeleteCameraScreen.kt) creates exactly one command
-      //    shape: {type: "UNPAIR", status: "pending", createdAt, createdBy,
-      //    homeDeviceId, cameraDeviceId} — no other type/status value or
-      //    field is ever written on create.
+      //  - Home App (DeleteCameraScreen.kt) creates the UNPAIR shape, and
+      //    another Home App flow creates CONFIRM_PLACEMENT — both as
+      //    {type, status: "pending", createdAt, createdBy, homeDeviceId,
+      //    cameraDeviceId} — no other type/status value or field is ever
+      //    written on create.
       //  - Camera App (PairingFirestoreManager.completeCommand) only ever
       //    calls .update("status", "completed", "completedAt", <server ts>)
       //    — no other field or status transition is ever performed.
@@ -121,7 +122,7 @@ service cloud.firestore {
           request.resource.data.keys().hasOnly([
             "type", "status", "createdAt", "createdBy", "homeDeviceId", "cameraDeviceId"
           ]) &&
-          request.resource.data.type == "UNPAIR" &&
+          request.resource.data.type in ["UNPAIR", "CONFIRM_PLACEMENT"] &&
           request.resource.data.status == "pending" &&
           request.resource.data.createdBy == request.auth.uid &&
           request.resource.data.cameraDeviceId == cameraDeviceId &&

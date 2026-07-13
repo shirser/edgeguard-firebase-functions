@@ -49,7 +49,8 @@ export async function mergeDoc(testEnv, path, data) {
 }
 
 // Exact command shape Home App writes on create (DeleteCameraScreen.kt) —
-// UNPAIR is the only type/status value the client ever produces.
+// UNPAIR and CONFIRM_PLACEMENT are the only type values the client ever
+// produces, and "pending" the only initial status.
 export function validCommand(overrides = {}) {
   return {
     type: "UNPAIR",

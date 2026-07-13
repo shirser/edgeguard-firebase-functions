@@ -63,6 +63,15 @@ describe("Home owner", () => {
     );
   });
 
+  it("creates a CONFIRM_PLACEMENT command", async () => {
+    await assertSucceeds(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "commands", "cmd1"),
+        validCommand({ type: "CONFIRM_PLACEMENT" })
+      )
+    );
+  });
+
   it("cannot create a command with a field the Home App never writes", async () => {
     await assertFails(
       setDoc(
@@ -81,7 +90,7 @@ describe("Home owner", () => {
     );
   });
 
-  it("cannot create a command with a type other than UNPAIR", async () => {
+  it("cannot create a command with an unrecognized type", async () => {
     await assertFails(
       setDoc(
         doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "commands", "cmd1"),
