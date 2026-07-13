@@ -1,0 +1,11 @@
+# Compiled Cloud Functions output — regenerated from functions/src/**/*.ts via
+# tsc, never hand-edited. functions/src/** is source of truth; graphing the
+# compiled JS produces duplicate/stale nodes for the same logic.
+# (functions/.gitignore already excludes this from git, but graphify only reads
+# .gitignore/.graphifyignore from the scan root up to the VCS root, not nested
+# subdirectory .gitignore files, so it needs restating here.)
+functions/lib/
+
+# Any other build/dist output that might appear under a package in this repo.
+**/dist/
+**/build/
