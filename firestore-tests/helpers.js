@@ -63,6 +63,49 @@ export function validCommand(overrides = {}) {
   };
 }
 
+// Exact CONFIRM_PLACEMENT shape Home App writes (PlacementImageTransferInitiator) —
+// same base fields as validCommand() plus the sessionId/transferId pair that ties the
+// command to the webrtcSessions doc and the command doc id created for that transfer.
+export function validConfirmPlacementCommand(overrides = {}) {
+  return validCommand({
+    type: "CONFIRM_PLACEMENT",
+    sessionId: "session-1",
+    transferId: "transfer-1",
+    ...overrides,
+  });
+}
+
+// Exact shape the Home App will write on session create — status always
+// starts at "waiting_for_offer" with no SDP attached yet (see
+// firestore.rules' webrtcSessions match block for the lifecycle).
+export function validSession(overrides = {}) {
+  return {
+    cameraDeviceId: CAMERA_ID,
+    homeDeviceId: "home-device-1",
+    createdBy: HOME_UID,
+    purpose: "PLACEMENT_IMAGE",
+    status: "waiting_for_offer",
+    offerSdp: null,
+    offerType: null,
+    answerSdp: null,
+    answerType: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+    ...overrides,
+  };
+}
+
+export function validCandidate(overrides = {}) {
+  return {
+    sdpMid: "0",
+    sdpMLineIndex: 0,
+    candidate: "candidate:1 1 UDP 2130706431 10.0.0.1 12345 typ host",
+    createdAt: new Date(),
+    ...overrides,
+  };
+}
+
 export function homeDb(testEnv) {
   return testEnv.authenticatedContext(HOME_UID).firestore();
 }

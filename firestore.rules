@@ -34,6 +34,48 @@ service cloud.firestore {
       return isOwnerUid(cameraDeviceId) || isCameraUid(cameraDeviceId);
     }
 
+    // webrtcSessions field validation — kept close to the schema described
+    // at cameraLinks/{cameraDeviceId}/webrtcSessions/{sessionId} so the
+    // bounds below aren't a mystery divorced from the contract they guard.
+    function isValidStatus(status) {
+      return status in [
+        "waiting_for_offer", "waiting_for_answer", "connecting",
+        "connected", "completed", "failed"
+      ];
+    }
+
+    // SDP blobs run a few KB in practice; 10000 chars is generous headroom
+    // without allowing an unbounded payload.
+    function isValidSdp(sdp) {
+      return sdp == null || (sdp is string && sdp.size() > 0 && sdp.size() <= 10000);
+    }
+
+    function isValidOfferType(offerType) {
+      return offerType == null || offerType == "offer";
+    }
+
+    function isValidAnswerType(answerType) {
+      return answerType == null || answerType == "answer";
+    }
+
+    function isValidExpiresAt(expiresAt) {
+      return expiresAt is timestamp && expiresAt > request.time;
+    }
+
+    // A single ICE candidate line is well under a few hundred bytes in
+    // practice; 2000 chars bounds it far above real-world size without
+    // allowing an arbitrary payload.
+    function isValidCandidate(data) {
+      return data.keys().hasOnly(["sdpMid", "sdpMLineIndex", "candidate", "createdAt"]) &&
+        (data.sdpMid == null || (data.sdpMid is string && data.sdpMid.size() <= 256)) &&
+        data.sdpMLineIndex is int &&
+        data.sdpMLineIndex >= 0 &&
+        data.candidate is string &&
+        data.candidate.size() > 0 &&
+        data.candidate.size() <= 2000 &&
+        data.createdAt is timestamp;
+    }
+
     // users: own user can read; all writes go through Functions (admin SDK)
     match /users/{uid} {
       allow read: if request.auth != null && request.auth.uid == uid;
@@ -107,26 +149,42 @@ service cloud.firestore {
       //
       // Field contract below is taken from the actual client code, not
       // invented:
-      //  - Home App (DeleteCameraScreen.kt) creates the UNPAIR shape, and
-      //    another Home App flow creates CONFIRM_PLACEMENT — both as
+      //  - Home App (DeleteCameraScreen.kt) creates the UNPAIR shape as
       //    {type, status: "pending", createdAt, createdBy, homeDeviceId,
-      //    cameraDeviceId} — no other type/status value or field is ever
-      //    written on create.
+      //    cameraDeviceId} — no other field is ever written on create.
+      //  - Home App (PlacementImageTransferInitiator) creates CONFIRM_PLACEMENT
+      //    with those same base fields plus sessionId/transferId, which tie the
+      //    command to the webrtcSessions doc and command doc id created for the
+      //    same placement-image transfer. UNPAIR never carries these two fields.
       //  - Camera App (PairingFirestoreManager.completeCommand) only ever
       //    calls .update("status", "completed", "completedAt", <server ts>)
       //    — no other field or status transition is ever performed.
+      function isValidTransferRef(value) {
+        return value is string && value.size() > 0;
+      }
+
       match /commands/{commandId} {
         allow read: if isLinkedIdentity(cameraDeviceId);
 
         allow create: if isOwnerUid(cameraDeviceId) &&
-          request.resource.data.keys().hasOnly([
-            "type", "status", "createdAt", "createdBy", "homeDeviceId", "cameraDeviceId"
-          ]) &&
           request.resource.data.type in ["UNPAIR", "CONFIRM_PLACEMENT"] &&
           request.resource.data.status == "pending" &&
           request.resource.data.createdBy == request.auth.uid &&
           request.resource.data.cameraDeviceId == cameraDeviceId &&
-          request.resource.data.homeDeviceId is string;
+          request.resource.data.homeDeviceId is string &&
+          (
+            (request.resource.data.type == "CONFIRM_PLACEMENT" &&
+              request.resource.data.keys().hasOnly([
+                "type", "status", "createdAt", "createdBy", "homeDeviceId", "cameraDeviceId",
+                "sessionId", "transferId"
+              ]) &&
+              isValidTransferRef(request.resource.data.sessionId) &&
+              isValidTransferRef(request.resource.data.transferId)) ||
+            (request.resource.data.type == "UNPAIR" &&
+              request.resource.data.keys().hasOnly([
+                "type", "status", "createdAt", "createdBy", "homeDeviceId", "cameraDeviceId"
+              ]))
+          );
 
         // Camera may only flip status pending -> completed and stamp
         // completedAt; every other field (type, createdBy, createdAt,
@@ -173,6 +231,82 @@ service cloud.firestore {
       match /activityEvents/{eventId} {
         allow read: if isLinkedIdentity(cameraDeviceId);
         allow write: if false;
+      }
+
+      // webrtcSessions: minimal WebRTC signaling contract for a single
+      // Camera <-> Home session (PLACEMENT_IMAGE preview only). Firestore
+      // scaffolding only — no Cloud Function participates yet, and neither
+      // app has been wired up to it, so nothing here establishes an actual
+      // WebRTC connection.
+      //
+      // Lifecycle: Home creates the session in "waiting_for_offer" with no
+      // SDP set yet, then updates it in place to attach its own offer
+      // (status -> "waiting_for_answer"). The linked Camera reads the
+      // session and updates it in place to attach its answer and advance
+      // status further. Identity fields (cameraDeviceId, homeDeviceId,
+      // createdBy) and purpose are fixed at creation and immutable after;
+      // each side may only ever touch the fields it owns.
+      match /webrtcSessions/{sessionId} {
+        allow read: if isLinkedIdentity(cameraDeviceId);
+
+        allow create: if isOwnerUid(cameraDeviceId) &&
+          request.resource.data.keys().hasOnly([
+            "cameraDeviceId", "homeDeviceId", "createdBy", "purpose", "status",
+            "offerSdp", "offerType", "answerSdp", "answerType",
+            "createdAt", "updatedAt", "expiresAt"
+          ]) &&
+          request.resource.data.cameraDeviceId == cameraDeviceId &&
+          request.resource.data.homeDeviceId is string &&
+          request.resource.data.createdBy == request.auth.uid &&
+          request.resource.data.purpose == "PLACEMENT_IMAGE" &&
+          request.resource.data.status == "waiting_for_offer" &&
+          request.resource.data.offerSdp == null &&
+          request.resource.data.offerType == null &&
+          request.resource.data.answerSdp == null &&
+          request.resource.data.answerType == null &&
+          request.resource.data.createdAt is timestamp &&
+          request.resource.data.updatedAt is timestamp &&
+          isValidExpiresAt(request.resource.data.expiresAt);
+
+        // Home may only advance status and attach its own offer; the
+        // answer fields and every identity/purpose field stay untouched.
+        allow update: if isOwnerUid(cameraDeviceId) &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(["status", "offerSdp", "offerType", "updatedAt"]) &&
+          isValidStatus(request.resource.data.status) &&
+          isValidSdp(request.resource.data.offerSdp) &&
+          isValidOfferType(request.resource.data.offerType) &&
+          request.resource.data.updatedAt is timestamp;
+
+        // Camera may only advance status and attach its own answer; the
+        // offer fields and every identity/purpose field stay untouched.
+        allow update: if isCameraUid(cameraDeviceId) &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(["status", "answerSdp", "answerType", "updatedAt"]) &&
+          isValidStatus(request.resource.data.status) &&
+          isValidSdp(request.resource.data.answerSdp) &&
+          isValidAnswerType(request.resource.data.answerType) &&
+          request.resource.data.updatedAt is timestamp;
+
+        allow delete: if false;
+
+        // ICE candidates are append-only and split by origin so each side
+        // can only ever write its own — never edit or delete once sent.
+        // Both linked identities may read both subcollections: each side
+        // needs to see the other's candidates to complete the exchange.
+        match /homeCandidates/{candidateId} {
+          allow read: if isLinkedIdentity(cameraDeviceId);
+          allow create: if isOwnerUid(cameraDeviceId) &&
+            isValidCandidate(request.resource.data);
+          allow update, delete: if false;
+        }
+
+        match /cameraCandidates/{candidateId} {
+          allow read: if isLinkedIdentity(cameraDeviceId);
+          allow create: if isCameraUid(cameraDeviceId) &&
+            isValidCandidate(request.resource.data);
+          allow update, delete: if false;
+        }
       }
 
       // Deny any other/future subcollection by default (least privilege)

@@ -9,6 +9,9 @@ import {
   seedDoc,
   mergeDoc,
   validCommand,
+  validConfirmPlacementCommand,
+  validSession,
+  validCandidate,
   homeDb,
   cameraDb,
   strangerDb,
@@ -63,11 +66,47 @@ describe("Home owner", () => {
     );
   });
 
-  it("creates a CONFIRM_PLACEMENT command", async () => {
+  it("creates a CONFIRM_PLACEMENT command carrying sessionId/transferId", async () => {
     await assertSucceeds(
       setDoc(
         doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "commands", "cmd1"),
+        validConfirmPlacementCommand()
+      )
+    );
+  });
+
+  it("cannot create a CONFIRM_PLACEMENT command missing sessionId/transferId", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "commands", "cmd1"),
         validCommand({ type: "CONFIRM_PLACEMENT" })
+      )
+    );
+  });
+
+  it("cannot create a CONFIRM_PLACEMENT command with an empty sessionId", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "commands", "cmd1"),
+        validConfirmPlacementCommand({ sessionId: "" })
+      )
+    );
+  });
+
+  it("cannot create a CONFIRM_PLACEMENT command with an empty transferId", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "commands", "cmd1"),
+        validConfirmPlacementCommand({ transferId: "" })
+      )
+    );
+  });
+
+  it("cannot create a UNPAIR command carrying sessionId/transferId", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "commands", "cmd1"),
+        validCommand({ sessionId: "session-1", transferId: "transfer-1" })
       )
     );
   });
@@ -444,6 +483,312 @@ describe("Parent cameraLinks/{cameraDeviceId} document", () => {
         homeDeviceId: "home-device-1",
         updatedAt: new Date(),
       })
+    );
+  });
+});
+
+describe("webrtcSessions: Home (linked)", () => {
+  beforeEach(() => seedClaim(testEnv));
+
+  it("creates a signaling session in waiting_for_offer", async () => {
+    await assertSucceeds(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession()
+      )
+    );
+  });
+
+  it("cannot create a session with a purpose other than PLACEMENT_IMAGE", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "REMOTE_VIEW" })
+      )
+    );
+  });
+
+  it("cannot create a session with an initial status other than waiting_for_offer", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ status: "connected" })
+      )
+    );
+  });
+
+  it("cannot create a session with a bogus status value", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ status: "bogus" })
+      )
+    );
+  });
+
+  it("cannot create a session whose cameraDeviceId field spoofs a different camera", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ cameraDeviceId: "some-other-camera" })
+      )
+    );
+  });
+
+  it("cannot create a session claiming to be created by someone else", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ createdBy: "someone-else-uid" })
+      )
+    );
+  });
+
+  it("cannot create a session with an already-expired expiresAt", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ expiresAt: new Date(Date.now() - 1000) })
+      )
+    );
+  });
+
+  it("cannot create a session carrying an extra field (e.g. an inlined image)", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ photoBase64: "/9j/4AAQSkZJRgABAQAAAQABAAD..." })
+      )
+    );
+  });
+
+  it("attaches its own offer and advances status", async () => {
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
+    await assertSucceeds(
+      updateDoc(doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        offerSdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n...",
+        offerType: "offer",
+        status: "waiting_for_answer",
+        updatedAt: new Date(),
+      })
+    );
+  });
+
+  it("cannot attach an oversized offer SDP", async () => {
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
+    await assertFails(
+      updateDoc(doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        offerSdp: "x".repeat(10001),
+        offerType: "offer",
+        status: "waiting_for_answer",
+        updatedAt: new Date(),
+      })
+    );
+  });
+
+  it("cannot write the answer fields", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ status: "waiting_for_answer", offerSdp: "offer-sdp", offerType: "offer" })
+    );
+    await assertFails(
+      updateDoc(doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        answerSdp: "answer-sdp",
+        answerType: "answer",
+        status: "connecting",
+      })
+    );
+  });
+
+  it("cannot change identity fields after creation", async () => {
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
+    await assertFails(
+      updateDoc(doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        homeDeviceId: "some-other-home-device",
+      })
+    );
+  });
+
+  it("can write its own ICE candidates to homeCandidates", async () => {
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
+    await assertSucceeds(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "homeCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+
+  it("cannot write ICE candidates to cameraCandidates", async () => {
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "cameraCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+
+  it("cannot write an ICE candidate with an empty candidate string", async () => {
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "homeCandidates", "c1"),
+        validCandidate({ candidate: "" })
+      )
+    );
+  });
+
+  it("cannot write an oversized ICE candidate string", async () => {
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "homeCandidates", "c1"),
+        validCandidate({ candidate: "x".repeat(2001) })
+      )
+    );
+  });
+
+  it("reads both candidate subcollections", async () => {
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "cameraCandidates", "c1"],
+      validCandidate()
+    );
+    await assertSucceeds(
+      getDoc(doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "cameraCandidates", "c1"))
+    );
+  });
+});
+
+describe("webrtcSessions: Camera (linked)", () => {
+  beforeEach(async () => {
+    await seedClaim(testEnv);
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ status: "waiting_for_answer", offerSdp: "offer-sdp", offerType: "offer" })
+    );
+  });
+
+  it("reads its own session", async () => {
+    await assertSucceeds(
+      getDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"))
+    );
+  });
+
+  it("writes its own answer and advances status", async () => {
+    await assertSucceeds(
+      updateDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        answerSdp: "v=0\r\no=- 2 1 IN IP4 127.0.0.1\r\n...",
+        answerType: "answer",
+        status: "connecting",
+        updatedAt: new Date(),
+      })
+    );
+  });
+
+  it("cannot create a session", async () => {
+    await assertFails(
+      setDoc(
+        doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s2"),
+        validSession()
+      )
+    );
+  });
+
+  it("cannot change identity fields (cameraDeviceId, homeDeviceId, createdBy)", async () => {
+    await assertFails(
+      updateDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        cameraDeviceId: "some-other-camera",
+      })
+    );
+    await assertFails(
+      updateDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        homeDeviceId: "some-other-home-device",
+      })
+    );
+    await assertFails(
+      updateDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        createdBy: CAMERA_UID,
+      })
+    );
+  });
+
+  it("cannot write the offer fields", async () => {
+    await assertFails(
+      updateDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        offerSdp: "tampered-offer",
+        status: "waiting_for_answer",
+      })
+    );
+  });
+
+  it("cannot add an arbitrary field (e.g. an inlined image)", async () => {
+    await assertFails(
+      updateDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        answerSdp: "answer-sdp",
+        answerType: "answer",
+        status: "connecting",
+        photoBase64: "/9j/4AAQSkZJRgABAQAAAQABAAD...",
+      })
+    );
+  });
+
+  it("can write its own ICE candidates to cameraCandidates", async () => {
+    await assertSucceeds(
+      setDoc(
+        doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "cameraCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+
+  it("cannot write ICE candidates to homeCandidates", async () => {
+    await assertFails(
+      setDoc(
+        doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "homeCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+});
+
+describe("webrtcSessions: stranger authenticated user", () => {
+  beforeEach(async () => {
+    await seedClaim(testEnv);
+    await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
+  });
+
+  it("cannot create a session for someone else's camera", async () => {
+    await assertFails(
+      setDoc(
+        doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s2"),
+        validSession()
+      )
+    );
+  });
+
+  it("cannot read the session", async () => {
+    await assertFails(
+      getDoc(doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"))
+    );
+  });
+
+  it("cannot write candidates to either subcollection", async () => {
+    await assertFails(
+      setDoc(
+        doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "homeCandidates", "c1"),
+        validCandidate()
+      )
+    );
+    await assertFails(
+      setDoc(
+        doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "cameraCandidates", "c1"),
+        validCandidate()
+      )
     );
   });
 });
