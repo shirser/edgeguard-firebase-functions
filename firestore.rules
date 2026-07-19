@@ -234,10 +234,12 @@ service cloud.firestore {
       }
 
       // webrtcSessions: minimal WebRTC signaling contract for a single
-      // Camera <-> Home session (PLACEMENT_IMAGE preview only). Firestore
-      // scaffolding only — no Cloud Function participates yet, and neither
-      // app has been wired up to it, so nothing here establishes an actual
-      // WebRTC connection.
+      // Camera <-> Home session (PLACEMENT_IMAGE preview and ACTIVITY_ZONE
+      // transfer). Firestore scaffolding only — this collection carries
+      // offer/answer/ICE signaling metadata alone; the ACTIVITY_ZONE
+      // purpose never puts zone coordinates here, since request.resource.data
+      // is closed to exactly the keys listed below (no free-form payload
+      // field exists for either purpose to smuggle app data through).
       //
       // Lifecycle: Home creates the session in "waiting_for_offer" with no
       // SDP set yet, then updates it in place to attach its own offer
@@ -258,7 +260,7 @@ service cloud.firestore {
           request.resource.data.cameraDeviceId == cameraDeviceId &&
           request.resource.data.homeDeviceId is string &&
           request.resource.data.createdBy == request.auth.uid &&
-          request.resource.data.purpose == "PLACEMENT_IMAGE" &&
+          request.resource.data.purpose in ["PLACEMENT_IMAGE", "ACTIVITY_ZONE"] &&
           request.resource.data.status == "waiting_for_offer" &&
           request.resource.data.offerSdp == null &&
           request.resource.data.offerType == null &&

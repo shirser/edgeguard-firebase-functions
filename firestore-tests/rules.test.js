@@ -756,6 +756,170 @@ describe("webrtcSessions: Camera (linked)", () => {
   });
 });
 
+describe("webrtcSessions: ACTIVITY_ZONE purpose", () => {
+  beforeEach(() => seedClaim(testEnv));
+
+  it("linked Home creates an ACTIVITY_ZONE signaling session", async () => {
+    await assertSucceeds(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "ACTIVITY_ZONE" })
+      )
+    );
+  });
+
+  it("stranger cannot create an ACTIVITY_ZONE session", async () => {
+    await assertFails(
+      setDoc(
+        doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "ACTIVITY_ZONE" })
+      )
+    );
+  });
+
+  it("cannot create an ACTIVITY_ZONE session whose cameraDeviceId field spoofs a different camera", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "ACTIVITY_ZONE", cameraDeviceId: "some-other-camera" })
+      )
+    );
+  });
+
+  it("cannot create an ACTIVITY_ZONE session with a non-string homeDeviceId", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "ACTIVITY_ZONE", homeDeviceId: 12345 })
+      )
+    );
+  });
+
+  it("cannot create a session with an unrecognized purpose", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "REMOTE_VIEW_LIVE" })
+      )
+    );
+  });
+
+  it("cannot create an ACTIVITY_ZONE session carrying zone coordinates or any extra field", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({
+          purpose: "ACTIVITY_ZONE",
+          zoneCoordinates: [{ x: 0.1, y: 0.2 }, { x: 0.4, y: 0.6 }],
+        })
+      )
+    );
+  });
+
+  it("Home attaches its offer and advances status on an ACTIVITY_ZONE session", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ purpose: "ACTIVITY_ZONE" })
+    );
+    await assertSucceeds(
+      updateDoc(doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        offerSdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n...",
+        offerType: "offer",
+        status: "waiting_for_answer",
+        updatedAt: new Date(),
+      })
+    );
+  });
+
+  it("Home cannot smuggle zone coordinates into an update", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ purpose: "ACTIVITY_ZONE" })
+    );
+    await assertFails(
+      updateDoc(doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        status: "waiting_for_answer",
+        updatedAt: new Date(),
+        zoneCoordinates: [{ x: 0.1, y: 0.2 }],
+      })
+    );
+  });
+
+  it("linked Camera reads and writes its answer on an ACTIVITY_ZONE session", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({
+        purpose: "ACTIVITY_ZONE",
+        status: "waiting_for_answer",
+        offerSdp: "offer-sdp",
+        offerType: "offer",
+      })
+    );
+    await assertSucceeds(
+      getDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"))
+    );
+    await assertSucceeds(
+      updateDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        answerSdp: "v=0\r\no=- 2 1 IN IP4 127.0.0.1\r\n...",
+        answerType: "answer",
+        status: "connecting",
+        updatedAt: new Date(),
+      })
+    );
+  });
+
+  it("Camera writes its own ICE candidates to cameraCandidates on an ACTIVITY_ZONE session", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ purpose: "ACTIVITY_ZONE" })
+    );
+    await assertSucceeds(
+      setDoc(
+        doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "cameraCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+
+  it("Home writes its own ICE candidates to homeCandidates on an ACTIVITY_ZONE session", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ purpose: "ACTIVITY_ZONE" })
+    );
+    await assertSucceeds(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "homeCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+
+  it("stranger cannot write ICE candidates on an ACTIVITY_ZONE session", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ purpose: "ACTIVITY_ZONE" })
+    );
+    await assertFails(
+      setDoc(
+        doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "homeCandidates", "c1"),
+        validCandidate()
+      )
+    );
+    await assertFails(
+      setDoc(
+        doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "cameraCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+});
+
 describe("webrtcSessions: stranger authenticated user", () => {
   beforeEach(async () => {
     await seedClaim(testEnv);
