@@ -116,6 +116,15 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // registeredDevices: global device registry (see functions/src/deviceRegistry.ts,
+    // docs/DEVICE_REGISTRY.md). Functions (Admin SDK) only, both directions -- no client, not
+    // even the device's own owner, may read or write it. This stage only creates/maintains this
+    // collection; it is not yet consulted to limit device counts or deny access to anything.
+    match /registeredDevices/{deviceId} {
+      allow read: if false;
+      allow create, update, delete: if false;
+    }
+
     // cameraLinks: only the linked Home (uid) or linked Camera (cameraAuthUid)
     // identity for that specific cameraDeviceId — never "any authenticated user".
     match /cameraLinks/{cameraDeviceId} {

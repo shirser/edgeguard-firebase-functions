@@ -6,6 +6,12 @@ import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 import * as crypto from "crypto";
 import { getEffectiveUserEntitlements } from "./entitlements";
+import {
+  registerLegacyCamera,
+  registerLegacyHome,
+  attachCameraOwner,
+  detachCameraOwner,
+} from "./deviceRegistry";
 
 admin.initializeApp();
 
@@ -22,6 +28,24 @@ export type {
   EffectiveUserEntitlements,
   CorruptEntitlementsReason,
 } from "./entitlements";
+
+export {
+  DEVICE_REGISTRY_SCHEMA_VERSION,
+  identityConflictReason,
+  registerLegacyCamera,
+  registerLegacyHome,
+  attachCameraOwner,
+  detachCameraOwner,
+  touchRegisteredDevice,
+} from "./deviceRegistry";
+export type {
+  DeviceRole,
+  DeviceStatus,
+  DeviceSuspensionReason,
+  DeviceIdentityMode,
+  RegisteredDevice,
+  DeviceIdentityConflictReason,
+} from "./deviceRegistry";
 
 function hashSecret(secret: string): string {
   return crypto.createHash("sha256").update(secret).digest("hex");
@@ -162,6 +186,13 @@ export const createCameraPairingSession = onCall(
     logger.info("CREATE_PAIRING_SESSION_START", { cameraDeviceId });
 
     const db = admin.firestore();
+
+    // Best-effort device-registry bookkeeping (see deviceRegistry.ts) -- registers this Camera
+    // installation, pre-pairing, with ownerUid null. Never blocks or changes this function's
+    // response, and never touches an already-attached owner if this fires again for an
+    // already-paired Camera (e.g. reopening the pairing screen without unpairing first).
+    await registerLegacyCamera(db, cameraDeviceId, request.auth.uid);
+
     const pairingRef = db.collection("cameraPairingSessions").doc();
     const pairingId = pairingRef.id;
     const expiresAt = admin.firestore.Timestamp.fromMillis(
@@ -306,6 +337,7 @@ export const claimCameraForUser = onCall(
             cameraCount: (userSnap.get("cameraCount") as number) ?? 0,
             cameraLimit: 1 + subscriptionUnits * 5,
             pairingStateWritten: true,
+            cameraAuthUid: claimSnap.get("cameraAuthUid") as string | null | undefined,
           };
         }
         logger.info("CLAIM_CAMERA_ALREADY_CLAIMED", { cameraDeviceId });
@@ -410,8 +442,25 @@ export const claimCameraForUser = onCall(
 
       logger.info("CLAIM_CAMERA_PAIRING_STATE_WRITE_QUEUED", { cameraDeviceId });
 
-      return { cameraCount: newCameraCount, cameraLimit, pairingStateWritten: true };
+      return {
+        cameraCount: newCameraCount,
+        cameraLimit,
+        pairingStateWritten: true,
+        cameraAuthUid,
+      };
     });
+
+    // Best-effort device-registry bookkeeping (see deviceRegistry.ts), run only after the claim
+    // transaction above has already committed -- Firestore does not support nesting one
+    // transaction inside another, and registerLegacyHome()/attachCameraOwner() each run their own.
+    // Never blocks or changes this function's response. homeDeviceId's authUid/ownerUid are taken
+    // from the already-authenticated request (`uid`), never trusted from the client as-is beyond
+    // that. `cameraAuthUid` is the Camera's own auth uid as already verified by the pairing
+    // session validated inside the transaction above -- never `uid` (the Home caller).
+    await registerLegacyHome(db, homeDeviceId, uid);
+    if (txResult.cameraAuthUid) {
+      await attachCameraOwner(db, cameraDeviceId, txResult.cameraAuthUid, uid);
+    }
 
     logger.info("CLAIM_CAMERA_TRANSACTION_DONE", {
       cameraDeviceId,
@@ -599,6 +648,13 @@ export const releaseCameraForUser = onCall(
       });
     });
 
+    // Best-effort device-registry bookkeeping (see deviceRegistry.ts) -- a normal unpair clears
+    // ownerUid back to null but is never a revocation (status/identityMode/publicKey/authUid/
+    // revokedAt are untouched). Run after the transaction above has already committed (Firestore
+    // does not support nesting one transaction inside another); never blocks or changes this
+    // function's response.
+    await detachCameraOwner(db, cameraDeviceId);
+
     logger.info("RELEASE_CAMERA_PAIRING_STATE_WRITTEN", { cameraDeviceId });
 
     logger.info("RELEASE_CAMERA_SUCCESS", { uid, cameraDeviceId });
@@ -686,6 +742,11 @@ export const unpairCameraFromDevice = onCall(
         unpairedBy: "camera",
       });
     });
+
+    // Best-effort device-registry bookkeeping (see deviceRegistry.ts) -- see releaseCameraForUser
+    // above for why this always runs (even the "already unclaimed" no-op branch of the
+    // transaction) and what it does/doesn't touch.
+    await detachCameraOwner(db, cameraDeviceId);
 
     logger.info("UNPAIR_CAMERA_FROM_DEVICE_SUCCESS", { cameraDeviceId });
 
@@ -792,6 +853,10 @@ export const releaseCameraFromCamera = onCall(
         return ownerUid;
       });
 
+      // Best-effort device-registry bookkeeping (see deviceRegistry.ts) -- see
+      // releaseCameraForUser above for why this always runs and what it does/doesn't touch.
+      await detachCameraOwner(db, cameraDeviceId);
+
       logger.info("RELEASE_CAMERA_FROM_CAMERA_PAIRING_STATE_WRITTEN", {
         cameraDeviceId,
       });
@@ -870,6 +935,11 @@ export const submitCameraEvent = onCall(
       logger.info("SUBMIT_CAMERA_EVENT_PERMISSION_DENIED", { cameraDeviceId });
       throw new HttpsError("permission-denied", "PERMISSION_DENIED");
     }
+
+    // Best-effort device-registry lazy migration (see deviceRegistry.ts) for an already-paired
+    // Camera that predates this registry -- only reached once the cameraClaims-based ownership
+    // check above has already succeeded. Never blocks or changes this function's response.
+    await attachCameraOwner(db, cameraDeviceId, linkedCameraAuthUid, claimSnap.get("uid") as string);
 
     await handleCameraEvent(db, cameraDeviceId, type, title, body, severity);
 
@@ -980,6 +1050,38 @@ export async function verifyCameraAccess(
   return "ok";
 }
 
+// Same access check as verifyCameraAccess, but reads cameraClaims exactly once and returns the
+// verified cameraAuthUid/ownerUid alongside it -- used by callables (getTurnCredentials) that
+// need both the access decision and those two fields for the device registry's lazy migration
+// (see deviceRegistry.ts), so they never have to read cameraClaims a second, potentially
+// inconsistent time right after verifyCameraAccess's own internal read. Kept separate from
+// verifyCameraAccess itself (rather than widening its return shape) so verifyCameraAccess's
+// existing "ok"|"not-found"|"denied" contract, and its own tests, are untouched.
+export async function getVerifiedCameraClaim(
+  db: admin.firestore.Firestore,
+  cameraDeviceId: string,
+  callerUid: string
+): Promise<{
+  access: "ok" | "not-found" | "denied";
+  cameraAuthUid?: string | null;
+  ownerUid?: string;
+}> {
+  const claimSnap = await db.collection("cameraClaims").doc(cameraDeviceId).get();
+
+  if (!claimSnap.exists) {
+    return { access: "not-found" };
+  }
+
+  const ownerUid = claimSnap.get("uid") as string | undefined;
+  const cameraAuthUid = claimSnap.get("cameraAuthUid") as string | null | undefined;
+
+  if (callerUid !== ownerUid && callerUid !== cameraAuthUid) {
+    return { access: "denied" };
+  }
+
+  return { access: "ok", cameraAuthUid, ownerUid };
+}
+
 // Vends short-lived (10 minute) coturn TURN REST credentials for a specific
 // paired camera. Called by either the Home App (as the WebRTC session
 // initiator, e.g. Live View) or the Camera App (as the session responder)
@@ -1012,17 +1114,26 @@ export const getTurnCredentials = onCall(
     logger.info("GET_TURN_CREDENTIALS_START", { uid, cameraDeviceId, purpose });
 
     const db = admin.firestore();
-    const access = await verifyCameraAccess(db, cameraDeviceId, uid);
+    const claim = await getVerifiedCameraClaim(db, cameraDeviceId, uid);
 
-    if (access === "not-found") {
+    if (claim.access === "not-found") {
       logger.info("GET_TURN_CREDENTIALS_NOT_FOUND", { uid, cameraDeviceId, purpose });
       throw new HttpsError("not-found", "CAMERA_NOT_FOUND");
     }
 
-    if (access === "denied") {
+    if (claim.access === "denied") {
       logger.info("GET_TURN_CREDENTIALS_PERMISSION_DENIED", { uid, cameraDeviceId, purpose });
       throw new HttpsError("permission-denied", "PERMISSION_DENIED");
     }
+
+    // Best-effort device-registry lazy migration (see deviceRegistry.ts) for an already-paired
+    // Camera that predates this registry -- only reached once getVerifiedCameraClaim above has
+    // already confirmed `uid` is a linked identity (Home owner or Camera) for this camera, using
+    // the SAME cameraClaims read that access check already performed (no second, potentially
+    // inconsistent read). getTurnCredentials is called by both Home and Camera, so the Camera's
+    // authUid is always read from cameraClaims itself, never from `uid` (the caller). Never
+    // blocks or changes this function's response.
+    await attachCameraOwner(db, cameraDeviceId, claim.cameraAuthUid, claim.ownerUid as string);
 
     // Entitlements gate: only turnAccessAllowed is enforced here today.
     // maxCameras/maxHomeDevices/maxConcurrentLiveSessions are intentionally

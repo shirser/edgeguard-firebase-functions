@@ -1152,3 +1152,57 @@ describe("userEntitlements", () => {
     await assertFails(deleteDoc(doc(homeDb(testEnv), "userEntitlements", HOME_UID)));
   });
 });
+
+// registeredDevices: global device registry (see functions/src/deviceRegistry.ts,
+// docs/DEVICE_REGISTRY.md) -- Functions (Admin SDK) only in both directions, mirroring
+// userEntitlements above exactly. No client, including the device's own owner, may read,
+// create, update, or delete it.
+describe("registeredDevices", () => {
+  const validRegisteredDeviceDoc = () => ({
+    schemaVersion: 1,
+    deviceId: CAMERA_ID,
+    role: "CAMERA",
+    authUid: CAMERA_UID,
+    ownerUid: HOME_UID,
+    status: "active",
+    suspensionReason: null,
+    identityMode: "legacy",
+    publicKey: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    lastSeenAt: new Date(),
+    revokedAt: null,
+  });
+
+  beforeEach(async () => {
+    await seedDoc(testEnv, ["registeredDevices", CAMERA_ID], validRegisteredDeviceDoc());
+  });
+
+  it("an unauthenticated client cannot read", async () => {
+    await assertFails(getDoc(doc(unauthedDb(testEnv), "registeredDevices", CAMERA_ID)));
+  });
+
+  it("the device's own owner cannot read it", async () => {
+    await assertFails(getDoc(doc(homeDb(testEnv), "registeredDevices", CAMERA_ID)));
+  });
+
+  it("another authenticated user cannot read it either", async () => {
+    await assertFails(getDoc(doc(strangerDb(testEnv), "registeredDevices", CAMERA_ID)));
+  });
+
+  it("a client cannot create a registered-device document", async () => {
+    await assertFails(
+      setDoc(doc(homeDb(testEnv), "registeredDevices", CAMERA_ID), validRegisteredDeviceDoc())
+    );
+  });
+
+  it("a client cannot update a registered-device document", async () => {
+    await assertFails(
+      updateDoc(doc(homeDb(testEnv), "registeredDevices", CAMERA_ID), { status: "revoked" })
+    );
+  });
+
+  it("a client cannot delete a registered-device document", async () => {
+    await assertFails(deleteDoc(doc(homeDb(testEnv), "registeredDevices", CAMERA_ID)));
+  });
+});
