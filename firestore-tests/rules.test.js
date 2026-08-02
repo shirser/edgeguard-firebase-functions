@@ -1,9 +1,10 @@
 import { before, after, beforeEach, describe, it } from "node:test";
 import { assertSucceeds, assertFails } from "@firebase/rules-unit-testing";
-import { doc, getDoc, setDoc, updateDoc } from "firebase/firestore";
+import { doc, getDoc, setDoc, updateDoc, deleteDoc } from "firebase/firestore";
 import {
   CAMERA_ID,
   CAMERA_UID,
+  HOME_UID,
   createTestEnv,
   seedClaim,
   seedDoc,
@@ -15,6 +16,7 @@ import {
   homeDb,
   cameraDb,
   strangerDb,
+  unauthedDb,
 } from "./helpers.js";
 
 let testEnv;
@@ -920,6 +922,146 @@ describe("webrtcSessions: ACTIVITY_ZONE purpose", () => {
   });
 });
 
+describe("webrtcSessions: ENTRY_EXIT_LINE purpose", () => {
+  beforeEach(() => seedClaim(testEnv));
+
+  it("linked Home creates an ENTRY_EXIT_LINE signaling session", async () => {
+    await assertSucceeds(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "ENTRY_EXIT_LINE" })
+      )
+    );
+  });
+
+  it("foreign/stranger Home cannot create an ENTRY_EXIT_LINE session", async () => {
+    await assertFails(
+      setDoc(
+        doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "ENTRY_EXIT_LINE" })
+      )
+    );
+  });
+
+  it("cannot create an ENTRY_EXIT_LINE session whose cameraDeviceId field spoofs a different camera", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "ENTRY_EXIT_LINE", cameraDeviceId: "some-other-camera" })
+      )
+    );
+  });
+
+  it("cannot create a session with an unrecognized purpose", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "SOME_UNKNOWN_PURPOSE" })
+      )
+    );
+  });
+
+  it("cannot create an ENTRY_EXIT_LINE session carrying line coordinates or any extra field", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({
+          purpose: "ENTRY_EXIT_LINE",
+          startPoint: { x: 0.12, y: 0.34 },
+          endPoint: { x: 0.56, y: 0.78 },
+        })
+      )
+    );
+  });
+
+  it("Home cannot smuggle line coordinates into an update", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ purpose: "ENTRY_EXIT_LINE" })
+    );
+    await assertFails(
+      updateDoc(doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        status: "waiting_for_answer",
+        updatedAt: new Date(),
+        startPoint: { x: 0.12, y: 0.34 },
+      })
+    );
+  });
+
+  it("linked Camera reads and writes its answer on an ENTRY_EXIT_LINE session", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({
+        purpose: "ENTRY_EXIT_LINE",
+        status: "waiting_for_answer",
+        offerSdp: "offer-sdp",
+        offerType: "offer",
+      })
+    );
+    await assertSucceeds(
+      getDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"))
+    );
+    await assertSucceeds(
+      updateDoc(doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"), {
+        answerSdp: "v=0\r\no=- 2 1 IN IP4 127.0.0.1\r\n...",
+        answerType: "answer",
+        status: "connecting",
+        updatedAt: new Date(),
+      })
+    );
+  });
+
+  it("Camera writes its own ICE candidates to cameraCandidates on an ENTRY_EXIT_LINE session", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ purpose: "ENTRY_EXIT_LINE" })
+    );
+    await assertSucceeds(
+      setDoc(
+        doc(cameraDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "cameraCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+
+  it("Home writes its own ICE candidates to homeCandidates on an ENTRY_EXIT_LINE session", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ purpose: "ENTRY_EXIT_LINE" })
+    );
+    await assertSucceeds(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "homeCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+
+  it("stranger cannot write ICE candidates on an ENTRY_EXIT_LINE session", async () => {
+    await seedDoc(
+      testEnv,
+      ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"],
+      validSession({ purpose: "ENTRY_EXIT_LINE" })
+    );
+    await assertFails(
+      setDoc(
+        doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "homeCandidates", "c1"),
+        validCandidate()
+      )
+    );
+    await assertFails(
+      setDoc(
+        doc(strangerDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1", "cameraCandidates", "c1"),
+        validCandidate()
+      )
+    );
+  });
+});
+
 describe("webrtcSessions: stranger authenticated user", () => {
   beforeEach(async () => {
     await seedClaim(testEnv);
@@ -954,5 +1096,59 @@ describe("webrtcSessions: stranger authenticated user", () => {
         validCandidate()
       )
     );
+  });
+});
+
+// userEntitlements/{uid}: server-managed plan/limits/TURN-access model (see
+// functions/src/entitlements.ts, docs/USER_ENTITLEMENTS.md) -- Functions
+// (Admin SDK) only in both directions. No client, including the document's
+// own uid owner, may read, create, update, or delete it; a user must never
+// be able to grant/inflate their own entitlements or even learn their raw
+// stored values by reading the document directly.
+describe("userEntitlements", () => {
+  const validEntitlementsDoc = () => ({
+    schemaVersion: 1,
+    plan: "free",
+    subscriptionStatus: "active",
+    maxCameras: 1,
+    maxHomeDevices: 1,
+    maxConcurrentLiveSessions: 1,
+    turnAccessAllowed: true,
+    source: "default",
+    validUntil: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+
+  beforeEach(async () => {
+    await seedDoc(testEnv, ["userEntitlements", HOME_UID], validEntitlementsDoc());
+  });
+
+  it("an unauthenticated client cannot read", async () => {
+    await assertFails(getDoc(doc(unauthedDb(testEnv), "userEntitlements", HOME_UID)));
+  });
+
+  it("the document's own uid owner cannot read it", async () => {
+    await assertFails(getDoc(doc(homeDb(testEnv), "userEntitlements", HOME_UID)));
+  });
+
+  it("another authenticated user cannot read it either", async () => {
+    await assertFails(getDoc(doc(strangerDb(testEnv), "userEntitlements", HOME_UID)));
+  });
+
+  it("the owner cannot create their own entitlements document", async () => {
+    await assertFails(
+      setDoc(doc(homeDb(testEnv), "userEntitlements", HOME_UID), validEntitlementsDoc())
+    );
+  });
+
+  it("the owner cannot update their own entitlements document", async () => {
+    await assertFails(
+      updateDoc(doc(homeDb(testEnv), "userEntitlements", HOME_UID), { turnAccessAllowed: false })
+    );
+  });
+
+  it("the owner cannot delete their own entitlements document", async () => {
+    await assertFails(deleteDoc(doc(homeDb(testEnv), "userEntitlements", HOME_UID)));
   });
 });

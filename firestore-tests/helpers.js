@@ -117,3 +117,7 @@ export function cameraDb(testEnv) {
 export function strangerDb(testEnv) {
   return testEnv.authenticatedContext(STRANGER_UID).firestore();
 }
+
+export function unauthedDb(testEnv) {
+  return testEnv.unauthenticatedContext().firestore();
+}

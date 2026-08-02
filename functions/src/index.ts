@@ -1,11 +1,27 @@
 import { onDocumentCreated } from "firebase-functions/v2/firestore";
 import { onValueWritten } from "firebase-functions/v2/database";
 import { onCall, HttpsError } from "firebase-functions/v2/https";
+import { defineSecret } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 import * as crypto from "crypto";
+import { getEffectiveUserEntitlements } from "./entitlements";
 
 admin.initializeApp();
+
+export {
+  ENTITLEMENTS_SCHEMA_VERSION,
+  getEffectiveUserEntitlements,
+  isExpired as isUserEntitlementsExpired,
+} from "./entitlements";
+export type {
+  EntitlementPlan,
+  EntitlementSubscriptionStatus,
+  EntitlementSource,
+  UserEntitlements,
+  EffectiveUserEntitlements,
+  CorruptEntitlementsReason,
+} from "./entitlements";
 
 function hashSecret(secret: string): string {
   return crypto.createHash("sha256").update(secret).digest("hex");
@@ -860,6 +876,177 @@ export const submitCameraEvent = onCall(
     logger.info("SUBMIT_CAMERA_EVENT_SUCCESS", { cameraDeviceId, type });
 
     return { success: true };
+  }
+);
+
+const ALLOWED_TURN_PURPOSES = new Set([
+  "LIVE_VIEW",
+  "PLACEMENT_PREVIEW",
+  "ACTIVITY_ZONE",
+  "ENTRY_EXIT_LINE",
+  "MEDIA_TRANSFER",
+]);
+
+const TURN_CREDENTIAL_TTL_SECONDS = 10 * 60;
+
+const TURN_ICE_URLS = [
+  "stun:turn.edgeguard.cc:3478",
+  "turn:turn.edgeguard.cc:3478?transport=udp",
+  "turn:turn.edgeguard.cc:3478?transport=tcp",
+  "turns:turn.edgeguard.cc:5349?transport=tcp",
+];
+
+// Cloud Secret Manager-backed TURN_REST_SECRET, shared with the coturn
+// server's own REST API secret (see buildTurnCredentialsResponse below).
+// Declared at module scope per firebase-functions v7's Secret Manager
+// convention (firebase-functions/params defineSecret) and attached via the
+// `secrets` option on the onCall below so it's mounted at runtime.
+const turnRestSecret = defineSecret("TURN_REST_SECRET");
+
+export function isValidTurnPurpose(purpose: unknown): boolean {
+  return typeof purpose === "string" && ALLOWED_TURN_PURPOSES.has(purpose);
+}
+
+// Pure coturn TURN REST API credential derivation
+// (https://github.com/coturn/coturn/blob/master/docs/turn_rest_api.md) --
+// kept free of Secret Manager/Firestore access so it's directly unit
+// testable.
+export function buildTurnUsername(expiresAtSeconds: number, uid: string): string {
+  return `${expiresAtSeconds}:${uid}`;
+}
+
+export function computeTurnCredential(secret: string, username: string): string {
+  return crypto.createHmac("sha1", secret).update(username).digest("base64");
+}
+
+// Builds the full getTurnCredentials response, given an already-resolved
+// secret value and the caller's uid. Takes `nowSeconds` as a parameter
+// (defaulting to the real clock) purely so tests can assert the exact
+// expiresAt value without a clock race. Throws internal/INTERNAL if the
+// secret hasn't been provisioned -- callers must not fall back to any
+// unauthenticated/default credential.
+export function buildTurnCredentialsResponse(
+  secret: string | undefined,
+  uid: string,
+  nowSeconds: number = Math.floor(Date.now() / 1000)
+): {
+  iceServers: Array<{ urls: string[]; username: string; credential: string }>;
+  expiresAt: number;
+} {
+  if (!secret) {
+    throw new HttpsError("internal", "INTERNAL");
+  }
+
+  const expiresAt = nowSeconds + TURN_CREDENTIAL_TTL_SECONDS;
+  const username = buildTurnUsername(expiresAt, uid);
+  const credential = computeTurnCredential(secret, username);
+
+  return {
+    iceServers: [
+      {
+        urls: TURN_ICE_URLS,
+        username,
+        credential,
+      },
+    ],
+    expiresAt,
+  };
+}
+
+// Reuses the exact same cameraClaims-based pairing/ownership model as the
+// rest of this file (mirrors firestore.rules' isLinkedIdentity(): the caller
+// must be either the linked Home owner (`uid`) or the linked Camera identity
+// (`cameraAuthUid`) for this cameraDeviceId) -- no parallel access model.
+// Takes `db` explicitly (same pattern as sendCameraNotification below) so it
+// can be exercised directly against the Firestore emulator in tests.
+export async function verifyCameraAccess(
+  db: admin.firestore.Firestore,
+  cameraDeviceId: string,
+  callerUid: string
+): Promise<"ok" | "not-found" | "denied"> {
+  const claimSnap = await db.collection("cameraClaims").doc(cameraDeviceId).get();
+
+  if (!claimSnap.exists) {
+    return "not-found";
+  }
+
+  const ownerUid = claimSnap.get("uid") as string | undefined;
+  const cameraAuthUid = claimSnap.get("cameraAuthUid") as string | undefined;
+
+  if (callerUid !== ownerUid && callerUid !== cameraAuthUid) {
+    return "denied";
+  }
+
+  return "ok";
+}
+
+// Vends short-lived (10 minute) coturn TURN REST credentials for a specific
+// paired camera. Called by either the Home App (as the WebRTC session
+// initiator, e.g. Live View) or the Camera App (as the session responder)
+// instead of each app baking a long-lived static TURN secret into its own
+// BuildConfig. `purpose` is required and validated against the same set of
+// WebRTC session purposes used elsewhere in this project's signaling schema,
+// but does not otherwise change the credentials issued -- it exists so
+// access requests are self-describing in logs/audits.
+export const getTurnCredentials = onCall(
+  { region: "europe-west1", secrets: [turnRestSecret] },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+
+    const uid = request.auth.uid;
+    const { cameraDeviceId, purpose } = request.data as {
+      cameraDeviceId?: string;
+      purpose?: string;
+    };
+
+    if (typeof cameraDeviceId !== "string" || cameraDeviceId.length === 0) {
+      throw new HttpsError("invalid-argument", "INVALID_CAMERA_DEVICE_ID");
+    }
+
+    if (!isValidTurnPurpose(purpose)) {
+      throw new HttpsError("invalid-argument", "INVALID_PURPOSE");
+    }
+
+    logger.info("GET_TURN_CREDENTIALS_START", { uid, cameraDeviceId, purpose });
+
+    const db = admin.firestore();
+    const access = await verifyCameraAccess(db, cameraDeviceId, uid);
+
+    if (access === "not-found") {
+      logger.info("GET_TURN_CREDENTIALS_NOT_FOUND", { uid, cameraDeviceId, purpose });
+      throw new HttpsError("not-found", "CAMERA_NOT_FOUND");
+    }
+
+    if (access === "denied") {
+      logger.info("GET_TURN_CREDENTIALS_PERMISSION_DENIED", { uid, cameraDeviceId, purpose });
+      throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+    }
+
+    // Entitlements gate: only turnAccessAllowed is enforced here today.
+    // maxCameras/maxHomeDevices/maxConcurrentLiveSessions are intentionally
+    // NOT checked yet -- they require a device registry and server-side
+    // Live View session tracking that don't exist yet (later work). Never
+    // surface *why* TURN was denied (plan, blocked status, expiry) to the
+    // client -- only the generic TURN_ACCESS_DENIED code.
+    const entitlements = await getEffectiveUserEntitlements(uid, db);
+    if (!entitlements.turnAccessAllowed) {
+      logger.info("GET_TURN_CREDENTIALS_TURN_ACCESS_DENIED", { uid, cameraDeviceId, purpose });
+      throw new HttpsError("permission-denied", "TURN_ACCESS_DENIED");
+    }
+
+    let response;
+    try {
+      response = buildTurnCredentialsResponse(turnRestSecret.value(), uid);
+    } catch (error) {
+      logger.error("GET_TURN_CREDENTIALS_MISSING_SECRET", { uid, cameraDeviceId, purpose });
+      throw error;
+    }
+
+    logger.info("GET_TURN_CREDENTIALS_SUCCESS", { uid, cameraDeviceId, purpose });
+
+    return response;
   }
 );
 

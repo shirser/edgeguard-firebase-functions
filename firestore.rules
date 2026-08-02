@@ -101,6 +101,21 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // userEntitlements: server-managed plan/limits/TURN-access model (see
+    // functions/src/entitlements.ts, docs/USER_ENTITLEMENTS.md). Functions
+    // (admin SDK) only, both directions — a user must never be able to read
+    // or write their own plan, limits, subscriptionStatus, turnAccessAllowed,
+    // or validUntil directly; the Admin SDK bypasses these rules regardless,
+    // so getEffectiveUserEntitlements() keeps working. No client read either
+    // at this stage (unlike e.g. users/{uid}, which the owner can read) --
+    // clients learn their effective entitlements only indirectly, through
+    // what server-side callables allow/deny (e.g. getTurnCredentials'
+    // TURN_ACCESS_DENIED), never by reading the document itself.
+    match /userEntitlements/{uid} {
+      allow read: if false;
+      allow create, update, delete: if false;
+    }
+
     // cameraLinks: only the linked Home (uid) or linked Camera (cameraAuthUid)
     // identity for that specific cameraDeviceId — never "any authenticated user".
     match /cameraLinks/{cameraDeviceId} {
@@ -234,12 +249,13 @@ service cloud.firestore {
       }
 
       // webrtcSessions: minimal WebRTC signaling contract for a single
-      // Camera <-> Home session (PLACEMENT_IMAGE preview and ACTIVITY_ZONE
-      // transfer). Firestore scaffolding only — this collection carries
-      // offer/answer/ICE signaling metadata alone; the ACTIVITY_ZONE
-      // purpose never puts zone coordinates here, since request.resource.data
-      // is closed to exactly the keys listed below (no free-form payload
-      // field exists for either purpose to smuggle app data through).
+      // Camera <-> Home session (PLACEMENT_IMAGE preview, ACTIVITY_ZONE
+      // transfer, ENTRY_EXIT_LINE transfer, and LIVE_VIEW streaming).
+      // Firestore scaffolding only — this collection carries offer/answer/ICE signaling metadata
+      // alone; none of these purposes puts application payload data here,
+      // since request.resource.data is closed to exactly the keys listed
+      // below (no free-form payload field exists for any purpose to
+      // smuggle app data through).
       //
       // Lifecycle: Home creates the session in "waiting_for_offer" with no
       // SDP set yet, then updates it in place to attach its own offer
@@ -260,7 +276,7 @@ service cloud.firestore {
           request.resource.data.cameraDeviceId == cameraDeviceId &&
           request.resource.data.homeDeviceId is string &&
           request.resource.data.createdBy == request.auth.uid &&
-          request.resource.data.purpose in ["PLACEMENT_IMAGE", "ACTIVITY_ZONE"] &&
+          request.resource.data.purpose in ["PLACEMENT_IMAGE", "ACTIVITY_ZONE", "ENTRY_EXIT_LINE", "LIVE_VIEW"] &&
           request.resource.data.status == "waiting_for_offer" &&
           request.resource.data.offerSdp == null &&
           request.resource.data.offerType == null &&
