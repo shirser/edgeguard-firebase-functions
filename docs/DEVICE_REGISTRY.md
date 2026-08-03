@@ -1,18 +1,22 @@
-# Device Registry — Stage 1
+# Device Registry — Stage 1 + Android Keystore identity (stage 2)
 
 A single global, Admin-SDK-only Firestore collection that records every known Camera/Home
 installation ("device"), independently of `cameraClaims`/`pairingState`. Implemented in
 `functions/src/deviceRegistry.ts`.
 
-**This stage only creates and maintains the registry.** It is not yet consulted anywhere to:
+**Stage 1** (unchanged by this document's stage-2 addition) only creates and maintains the
+registry with `identityMode: "legacy"`. **Stage 2** (this addition) lets a device upgrade itself
+from `"legacy"` to `"keystore"` by registering a real Android Keystore-backed public key, via the
+`registerDevicePublicKey` callable. Neither stage is yet consulted anywhere to:
 
 - limit device counts;
 - deny Live View;
-- verify Android Keystore signatures;
+- **verify a signature over any request** (registering a key is not the same as proving
+  possession of it on every subsequent call — see "What is enforced today, and what isn't" below);
 - replace `cameraClaims` (still the ownership source of truth);
 - replace `pairingState` (still the pairing-lifecycle source of truth).
 
-Existing pairing, unpair, notifications, and Live View behavior is unchanged. See
+Existing pairing, unpair, notifications, TURN, and Live View behavior is unchanged. See
 [`docs/USER_ENTITLEMENTS.md`](USER_ENTITLEMENTS.md) for the separate, also-not-yet-fully-enforced
 plan/limits model — the two are unrelated and this stage does not connect them.
 
@@ -43,8 +47,8 @@ exactly. Only server code (Admin SDK) may read or write it.
 | `ownerUid` | string \| null | For `HOME`: always equal to `authUid` (a Home device is self-owned). For `CAMERA`: `null` before pairing, the linked Home owner's uid after a successful claim, `null` again after a normal unpair. |
 | `status` | `"active" \| "suspended" \| "revoked"` | Administrative trust state — see "status vs. pairing status" below. |
 | `suspensionReason` | `"plan" \| "manual" \| "security" \| null` | *Why* the device is suspended — only meaningful while `status == "suspended"`. `null` for every device this stage creates, and never set to anything else by this stage (there is no suspend operation yet — see "What is enforced today" below). Kept as its own field, separate from `status`, so a future suspend operation can record a reason without overloading `status` itself with more values. |
-| `identityMode` | `"legacy" \| "keystore"` | Whether this device has a cryptographically-verified identity yet. Every device created by this stage is `"legacy"` — see "Legacy has no cryptographic proof" below. |
-| `publicKey` | string \| null | Reserved for a future Keystore-based identity. Always `null` today. |
+| `identityMode` | `"legacy" \| "keystore"` | Every device is created `"legacy"` (see "Legacy has no cryptographic proof" below). Flips to `"keystore"` exactly once, atomically with `publicKey`, via `registerDevicePublicKey` — see "Android Keystore identity" below. Never flips back. |
+| `publicKey` | string \| null | `null` until the device registers a real key. From then on, the canonical Base64 (standard alphabet, no wrapping) encoding of the device's X.509 SubjectPublicKeyInfo (SPKI) DER bytes — the full public key, not a fingerprint (see "Key format" below). Never replaced, cleared, or downgraded back to `null` once set. |
 | `createdAt` | Timestamp | Set once, at first creation. Never changes after. |
 | `updatedAt` | Timestamp | Bumped on every meaningful change (including a lazy-migration touch). |
 | `lastSeenAt` | Timestamp | Bumped whenever the device is confirmed active through an authenticated server call. |
@@ -89,14 +93,162 @@ accepted) — real, cryptographic proof-of-possession is exactly what `identityM
 
 ## `legacy` has no cryptographic proof
 
-Every device this stage creates is `identityMode: "legacy"`, `publicKey: null`. "Legacy" means
-"identified only by a Firebase Auth UID, the same way every device has worked until now" — it is
-*not* a lesser-trust flag in the sense of being second-class, but it does mean there is no signature
-or hardware-backed proof that the installation claiming a given `deviceId`/`authUid` is who it says
-it is beyond having a valid Firebase Auth session. Android Keystore signature verification
-(`identityMode: "keystore"`, a real, non-null `publicKey`, and a verification step somewhere in the
-request path) is an explicitly separate, future task — not implemented, not even sketched at the
-Firestore-schema level beyond reserving these two fields.
+Every device is *created* `identityMode: "legacy"`, `publicKey: null`. "Legacy" means "identified
+only by a Firebase Auth UID, the same way every device has worked until now" — it is *not* a
+lesser-trust flag in the sense of being second-class, but it does mean there is no signature or
+hardware-backed proof that the installation claiming a given `deviceId`/`authUid` is who it says
+it is beyond having a valid Firebase Auth session. A device can upgrade itself to
+`identityMode: "keystore"` via `registerDevicePublicKey` (below) — but registering a key is still
+not the same as *proving possession of it on every request*; that (a challenge/signature
+verification step on sensitive calls) is an explicitly separate, later task — see "What is
+enforced today, and what isn't".
+
+## Android Keystore identity: `registerDevicePublicKey`
+
+A callable Cloud Function, region `europe-west1`, that lets an already-registered `"legacy"`
+device upgrade itself to `"keystore"` by submitting its real Android Keystore public key.
+Implemented as the callable itself in `functions/src/index.ts` plus a dedicated, strict (not
+best-effort) registry operation, `applyPublicKeyRegistration()`, in `functions/src/deviceRegistry.ts`
+— unlike every Stage 1 operation, this one never swallows a Firestore error, and never creates
+`registeredDevices/{deviceId}` itself (see "Bootstrap trust model" below).
+
+### Callable contract
+
+Request:
+
+```typescript
+{
+  deviceId: string;       // the device's own existing cameraDeviceId/homeDeviceId, unchanged
+  role: "HOME" | "CAMERA";
+  publicKey: string;      // canonical Base64 (standard alphabet) of X.509 SPKI DER, ≤ 512 chars
+  algorithm: "ES256";     // the only value accepted today
+}
+```
+
+Response (identical shape for a brand-new registration and an idempotent repeat of the same key):
+
+```typescript
+{
+  success: true;
+  identityMode: "keystore";
+}
+```
+
+Errors (`HttpsError`, code / message):
+
+| Code | Message | Meaning |
+|---|---|---|
+| `unauthenticated` | `UNAUTHENTICATED` | No `request.auth`. |
+| `invalid-argument` | `INVALID_DEVICE_ID` | Not a string, blank after trim, or over 128 characters. |
+| `invalid-argument` | `INVALID_ROLE` | Not exactly `"HOME"` or `"CAMERA"`. |
+| `invalid-argument` | `INVALID_ALGORITHM` | Not exactly `"ES256"`. |
+| `invalid-argument` | `INVALID_PUBLIC_KEY` | Empty, over 512 characters, not standard/canonical Base64, contains whitespace or Base64URL characters, not a well-formed SPKI DER structure, not an EC key, or not on the P-256 curve — see `validateEcP256PublicKey()`, which never reveals *which* of these failed to the client, only internally (see "Logging"). |
+| `not-found` | `DEVICE_NOT_REGISTERED` | `registeredDevices/{deviceId}` does not exist — see "Bootstrap trust model". |
+| `not-found` | `CAMERA_NOT_CLAIMED` | Role `CAMERA`, and `cameraClaims/{deviceId}` does not exist. |
+| `permission-denied` | `DEVICE_IDENTITY_MISMATCH` | The caller's identity does not match what's required for this role/device (see "Authorization" below) — one generic message for every kind of mismatch (role, authUid, ownerUid), deliberately not distinguished for the client. |
+| `failed-precondition` | `DEVICE_REVOKED` | The device's `status` is `"revoked"`. |
+| `failed-precondition` | `DEVICE_IDENTITY_CORRUPT` | The stored document is internally inconsistent (`legacy` with a non-null `publicKey`, or `keystore` with a null `publicKey`) — never auto-repaired. |
+| `failed-precondition` | `PUBLIC_KEY_ALREADY_REGISTERED` | Already `identityMode: "keystore"` with a *different* key than the one submitted. |
+| `internal` | `REGISTRY_WRITE_FAILED` | A genuine Firestore/transaction failure — never silently reported as success. |
+
+No challenge/signature fields exist in this request — deliberately out of scope for this stage.
+
+### Bootstrap trust model
+
+Registering a device and registering its cryptographic identity are different operations:
+`registerDevicePublicKey` **never creates** `registeredDevices/{deviceId}` — a missing document is
+always rejected (`DEVICE_NOT_REGISTERED`), never silently created with attacker-supplied role/key
+data. A device must already have gone through Stage 1's own registration
+(`registerLegacyCamera`/`registerLegacyHome`/`attachCameraOwner`) before it can ever upgrade to
+`"keystore"`.
+
+There is no cryptographic proof possible for the *first* key a legacy device ever registers —
+bootstrap trust is necessarily anchored to whichever identity mechanism already exists. This stage
+anchors it to the *strongest already-available* corroboration for each role, then makes that
+registration permanent (see "First-write-wins" below); closing the remaining gap is explicitly the
+next stage (challenge/signature verification on every sensitive request from then on).
+
+- **CAMERA — authorized via `cameraClaims`, not `ownerUid`, checked atomically with the write.**
+  `cameraClaims/{deviceId}` must exist, and `cameraClaims.cameraAuthUid` must equal
+  `request.auth.uid` — the same server-verified pairing-secret handshake result every other
+  Camera-authenticated callable in this file already relies on
+  (`verifyCameraAccess`/`getVerifiedCameraClaim`). This means registration is only possible
+  **post-claim** — a Camera cannot register a key before it has been paired, since `cameraClaims`
+  doesn't exist yet at that point. `ownerUid` is never consulted for a Camera's own authentication.
+  As a defense-in-depth cross-check, the stored registry document must *also* already have
+  `role: "CAMERA"` and `authUid` equal to that same `cameraClaims.cameraAuthUid` — catching any
+  historical drift between the two records, not just a mismatched caller.
+
+  Critically, `applyCameraPublicKeyRegistration()` reads `cameraClaims` **and**
+  `registeredDevices` inside **one** Firestore transaction, together with the eventual write —
+  never as a separate pre-check followed by a different transaction. An earlier version of this
+  callable checked `cameraClaims` outside any transaction and then ran a separate transaction just
+  for the registry update; that left a real window where a concurrent unpair (which deletes
+  `cameraClaims`) could land between the check and the write, letting a public key register even
+  though the claim backing it no longer existed by the time the write actually happened. Because
+  both reads and the write now share one transaction, Firestore's own contention/retry guarantees
+  that the whole "claim still exists and matches, therefore the key may be registered" decision is
+  atomic with the write itself.
+- **HOME — authorized via the registry document itself.** `registeredDevices/{deviceId}` must
+  already have `role: "HOME"`, `authUid == request.auth.uid`, **and** `ownerUid ==
+  request.auth.uid` (a Home device is always self-owned). Since `registerLegacyHome` only ever
+  runs inside `claimCameraForUser`, and `claimCameraForUser` is itself only reachable once the
+  Home App's own client-side gate requires a durable, Google-linked `request.auth.uid` (never the
+  throwaway anonymous bootstrap identity), a Home key registration is likewise only meaningful
+  **post-first-claim** in practice, even though nothing here reads `cameraClaims` for the HOME
+  case directly.
+
+### Key format
+
+EC, curve **P-256** (secp256r1/prime256v1), algorithm identifier **ES256** — verified via
+`crypto.createPublicKey({ key: derBuffer, format: "der", type: "spki" })` then
+`keyObject.asymmetricKeyType === "ec"` and a JWK export's `crv === "P-256"` (JWK's curve name is
+pinned by RFC 7518, unlike `asymmetricKeyDetails.namedCurve`'s OpenSSL alias `"prime256v1"`, which
+requires the reader to already know that alias *is* P-256 — the JWK check is the more
+standards-anchored, unambiguous one to rely on). Encoding: X.509 SubjectPublicKeyInfo (SPKI) DER,
+Base64 with the **standard** alphabet (not Base64URL), no line wrapping, no PEM headers, canonical
+(re-encoding the decoded bytes must reproduce the exact submitted string — `Buffer.from(str,
+"base64")` is lenient and silently drops characters it doesn't understand, so this round-trip
+check is what actually catches a malformed/non-canonical input). Maximum 512 characters (a real
+P-256 SPKI key is ~124 Base64 characters; the bound is generous headroom, not a tight fit).
+
+The full canonical Base64 public key is what's stored in Firestore — never a fingerprint in its
+place. A SHA-256 hex digest of the raw DER bytes (`publicKeyFingerprint`) is computed only for safe
+log correlation (see "Logging").
+
+### First-write-wins, never replaced
+
+Once `identityMode: "keystore"`, the stored `publicKey` can never be changed by
+`registerDevicePublicKey` again:
+
+- The exact same key, resubmitted → **idempotent success** (`{ success: true, identityMode:
+  "keystore" }`), `lastSeenAt` refreshed, `updatedAt` **not** touched.
+- A *different* key → **rejected** (`failed-precondition` / `PUBLIC_KEY_ALREADY_REGISTERED`), the
+  stored key is left completely unchanged.
+
+Two concurrent first-registration requests for the same device are resolved by Firestore's own
+transaction contention/retry mechanism (the same mechanism `claimCameraForUser`'s own idempotent
+claim branch already relies on): whichever transaction commits first wins; the other is
+automatically retried, re-reads the now-`"keystore"` document, and resolves to either the
+idempotent-success or the conflict path above depending on whether it submitted the same or a
+different key. There is never a last-write-wins replacement.
+
+### `suspended`/`revoked` behavior
+
+- `active` — registration proceeds normally.
+- `suspended` — registration is **still allowed** (a suspended device must be able to complete its
+  cryptographic migration), and `status`/`suspensionReason` are left completely untouched by it.
+- `revoked` — registration is **rejected** (`failed-precondition` / `DEVICE_REVOKED`) and the
+  document is left completely unchanged.
+
+### Logging
+
+Events: `REGISTER_DEVICE_PUBLIC_KEY_START/SUCCESS/IDEMPOTENT/DENIED/CONFLICT/INVALID/FAILED`, plus
+`DEVICE_REGISTRY_PUBLIC_KEY_CORRUPT` from inside `applyPublicKeyRegistration()` itself. Allowed
+metadata: `deviceId`, `role`, `algorithm`, `publicKeyFingerprint`, `reason`, `errorClass`. **Never**
+logged: the raw `publicKey`, the raw DER bytes, `request.auth.uid`, `ownerUid`, `cameraAuthUid`, the
+full request body, or the full Firestore document. On an invalid key, `publicKeyFingerprint` is
+simply absent (the DER couldn't be safely decoded to fingerprint in the first place).
 
 ## Identity is never overwritten
 
@@ -159,11 +311,14 @@ way.
 
 ## What is enforced today, and what isn't
 
-Enforced: nothing outside this module reads `registeredDevices` yet. It exists purely to start
-accumulating accurate device-identity data so a future stage can build limits/Keystore
-verification/revocation checks on top of real, already-populated data instead of starting from
-nothing.
+Enforced: a device can safely and durably register its real Keystore public key
+(`registerDevicePublicKey`), atomically flipping `identityMode` from `"legacy"` to `"keystore"`,
+first-write-wins, never replaceable. Nothing outside `deviceRegistry.ts`/`registerDevicePublicKey`
+reads or acts on `registeredDevices` yet.
 
 Not enforced (explicitly out of scope for this stage): device-count limits, Live View denial,
-Keystore signature verification, replacing `cameraClaims` or `pairingState`, and anything touching
-`userEntitlements`/`cameraCount`/`cameraLimit`.
+**signature verification of any request** (a registered public key is not yet used to verify
+anything — no challenge, no proof-of-possession check on subsequent calls), replacing
+`cameraClaims` or `pairingState`, and anything touching
+`userEntitlements`/`cameraCount`/`cameraLimit`. Challenge/signature verification, and later,
+actual enforcement based on `identityMode`/`status`, are explicitly separate, later tasks.

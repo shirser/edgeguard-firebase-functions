@@ -11,7 +11,12 @@ import {
   registerLegacyHome,
   attachCameraOwner,
   detachCameraOwner,
+  SUPPORTED_DEVICE_KEY_ALGORITHM,
+  validateEcP256PublicKey,
+  applyPublicKeyRegistration,
+  applyCameraPublicKeyRegistration,
 } from "./deviceRegistry";
+import type { PublicKeyRegistrationOutcome } from "./deviceRegistry";
 
 admin.initializeApp();
 
@@ -37,6 +42,10 @@ export {
   attachCameraOwner,
   detachCameraOwner,
   touchRegisteredDevice,
+  SUPPORTED_DEVICE_KEY_ALGORITHM,
+  validateEcP256PublicKey,
+  applyPublicKeyRegistration,
+  applyCameraPublicKeyRegistration,
 } from "./deviceRegistry";
 export type {
   DeviceRole,
@@ -45,6 +54,9 @@ export type {
   DeviceIdentityMode,
   RegisteredDevice,
   DeviceIdentityConflictReason,
+  PublicKeyInvalidReason,
+  PublicKeyValidation,
+  PublicKeyRegistrationOutcome,
 } from "./deviceRegistry";
 
 function hashSecret(secret: string): string {
@@ -1158,6 +1170,157 @@ export const getTurnCredentials = onCall(
     logger.info("GET_TURN_CREDENTIALS_SUCCESS", { uid, cameraDeviceId, purpose });
 
     return response;
+  }
+);
+
+const MAX_DEVICE_ID_LENGTH = 128;
+const MAX_DEVICE_PUBLIC_KEY_LENGTH = 512;
+
+// Android Keystore identity, stage 1: registers a device's real cryptographic public key,
+// flipping registeredDevices/{deviceId}.identityMode from "legacy" to "keystore" -- see
+// docs/DEVICE_REGISTRY.md. Deliberately does NOT verify a signature over anything yet (no
+// challenge/proof-of-possession) -- that is an explicitly separate, later task; this stage only
+// gets a real key safely on file, tied to whichever identity the registry already trusts.
+//
+// Never creates registeredDevices/{deviceId} -- registering a device (registerLegacyCamera/
+// registerLegacyHome/attachCameraOwner, all pre-existing) and registering its cryptographic
+// identity are different operations; a missing document is CAMERA_NOT_CLAIMED/DEVICE_NOT_REGISTERED,
+// never silently created here.
+export const registerDevicePublicKey = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+    const callerUid = request.auth.uid;
+
+    const { deviceId, role, publicKey, algorithm } = request.data as {
+      deviceId?: string;
+      role?: string;
+      publicKey?: string;
+      algorithm?: string;
+    };
+
+    if (typeof deviceId !== "string" || deviceId.trim().length === 0 || deviceId.length > MAX_DEVICE_ID_LENGTH) {
+      throw new HttpsError("invalid-argument", "INVALID_DEVICE_ID");
+    }
+
+    if (role !== "HOME" && role !== "CAMERA") {
+      throw new HttpsError("invalid-argument", "INVALID_ROLE");
+    }
+
+    if (algorithm !== SUPPORTED_DEVICE_KEY_ALGORITHM) {
+      throw new HttpsError("invalid-argument", "INVALID_ALGORITHM");
+    }
+
+    if (typeof publicKey !== "string" || publicKey.length === 0 || publicKey.length > MAX_DEVICE_PUBLIC_KEY_LENGTH) {
+      throw new HttpsError("invalid-argument", "INVALID_PUBLIC_KEY");
+    }
+
+    logger.info("REGISTER_DEVICE_PUBLIC_KEY_START", { deviceId, role, algorithm });
+
+    const keyValidation = validateEcP256PublicKey(publicKey);
+    if (!keyValidation.valid) {
+      logger.info("REGISTER_DEVICE_PUBLIC_KEY_INVALID", { deviceId, role, algorithm, reason: keyValidation.reason });
+      throw new HttpsError("invalid-argument", "INVALID_PUBLIC_KEY");
+    }
+
+    const db = admin.firestore();
+
+    // Authorization: HOME is authenticated directly via request.auth.uid, checked transactionally
+    // against the registry document itself inside applyPublicKeyRegistration. CAMERA is never
+    // authenticated via its own request -- it has no separate proof-of-possession yet -- so it is
+    // authorized via cameraClaims/{deviceId}.cameraAuthUid, the same server-verified
+    // pairing-secret handshake result every other Camera-authenticated callable in this file
+    // already relies on (verifyCameraAccess/getVerifiedCameraClaim). ownerUid is never used to
+    // authenticate a Camera -- only Home devices are authenticated via their own ownerUid.
+    //
+    // The CAMERA claim check is NOT a pre-check here: applyCameraPublicKeyRegistration reads
+    // cameraClaims AND registeredDevices inside one transaction together with the eventual write,
+    // so a concurrent unpair (which deletes cameraClaims) can never race between "verified" and
+    // "registered" -- see deviceRegistry.ts's own doc for why an out-of-transaction pre-check was
+    // not safe here.
+    let result: PublicKeyRegistrationOutcome;
+    try {
+      result =
+        role === "CAMERA"
+          ? await applyCameraPublicKeyRegistration(db, {
+              cameraDeviceId: deviceId,
+              authenticatedUid: callerUid,
+              canonicalPublicKey: keyValidation.canonicalBase64,
+            })
+          : await applyPublicKeyRegistration(db, {
+              deviceId,
+              role,
+              expectedAuthUid: callerUid,
+              expectedOwnerUid: callerUid,
+              canonicalPublicKey: keyValidation.canonicalBase64,
+            });
+    } catch (error: any) {
+      logger.error("REGISTER_DEVICE_PUBLIC_KEY_FAILED", {
+        deviceId,
+        role,
+        algorithm,
+        errorClass: error?.constructor?.name ?? "Error",
+      });
+      throw new HttpsError("internal", "REGISTRY_WRITE_FAILED");
+    }
+
+    switch (result.outcome) {
+      case "not_found":
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_DENIED", { deviceId, role, algorithm, reason: "DEVICE_NOT_REGISTERED" });
+        throw new HttpsError("not-found", "DEVICE_NOT_REGISTERED");
+      case "camera_not_claimed":
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_DENIED", { deviceId, role, algorithm, reason: "CAMERA_NOT_CLAIMED" });
+        throw new HttpsError("not-found", "CAMERA_NOT_CLAIMED");
+      case "role_mismatch":
+      case "auth_uid_mismatch":
+      case "owner_uid_mismatch":
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_DENIED", {
+          deviceId,
+          role,
+          algorithm,
+          reason: "DEVICE_IDENTITY_MISMATCH",
+        });
+        throw new HttpsError("permission-denied", "DEVICE_IDENTITY_MISMATCH");
+      case "revoked":
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_DENIED", { deviceId, role, algorithm, reason: "DEVICE_REVOKED" });
+        throw new HttpsError("failed-precondition", "DEVICE_REVOKED");
+      case "corrupt":
+        logger.warn("REGISTER_DEVICE_PUBLIC_KEY_DENIED", {
+          deviceId,
+          role,
+          algorithm,
+          reason: "DEVICE_IDENTITY_CORRUPT",
+        });
+        throw new HttpsError("failed-precondition", "DEVICE_IDENTITY_CORRUPT");
+      case "key_conflict":
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_CONFLICT", {
+          deviceId,
+          role,
+          algorithm,
+          publicKeyFingerprint: keyValidation.fingerprint,
+        });
+        throw new HttpsError("failed-precondition", "PUBLIC_KEY_ALREADY_REGISTERED");
+      case "idempotent":
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_IDEMPOTENT", {
+          deviceId,
+          role,
+          algorithm,
+          publicKeyFingerprint: keyValidation.fingerprint,
+        });
+        return { success: true, identityMode: "keystore" as const };
+      case "registered":
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_SUCCESS", {
+          deviceId,
+          role,
+          algorithm,
+          publicKeyFingerprint: keyValidation.fingerprint,
+        });
+        return { success: true, identityMode: "keystore" as const };
+      default:
+        throw new HttpsError("internal", "INTERNAL");
+    }
   }
 );
 

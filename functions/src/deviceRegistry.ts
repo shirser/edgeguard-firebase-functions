@@ -1,5 +1,6 @@
 import * as admin from "firebase-admin";
 import * as logger from "firebase-functions/logger";
+import * as crypto from "crypto";
 
 // Stage 1 of the EdgeGuard device registry: a single global, Admin-SDK-only collection that
 // records every known Camera/Home installation ("device") independently of cameraClaims/
@@ -291,4 +292,309 @@ export async function touchRegisteredDevice(db: admin.firestore.Firestore, devic
   } catch (error) {
     logWriteFailed("DEVICE_REGISTRY_TOUCH_WRITE_FAILED", deviceId, undefined, error);
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Android Keystore identity: registerDevicePublicKey (legacy -> keystore)
+// ---------------------------------------------------------------------------------------------
+// Everything below is deliberately NOT part of the best-effort upsertRegisteredDevice() core
+// above: registering a device's real cryptographic identity is a one-time, user-triggered,
+// security-relevant action, not a passive side effect of some other call succeeding. A caller
+// needs to know for certain whether it worked, so none of this ever swallows a Firestore error --
+// see applyPublicKeyRegistration()'s own doc for exactly what it does and does not catch.
+
+// The only fixed set of algorithms this stage accepts. Exported so the callable and its tests
+// share one source of truth for "ES256" instead of re-typing the literal string.
+export const SUPPORTED_DEVICE_KEY_ALGORITHM = "ES256" as const;
+
+// Every way validateEcP256PublicKey() below can reject an incoming key -- a fixed, stable enum,
+// safe to log (see its own doc): it describes *which check* failed, never any part of the key
+// itself.
+export type PublicKeyInvalidReason =
+  | "CONTAINS_WHITESPACE"
+  | "BASE64URL_VARIANT"
+  | "NOT_STANDARD_BASE64"
+  | "NON_CANONICAL_BASE64"
+  | "EMPTY_AFTER_DECODE"
+  | "MALFORMED_DER"
+  | "UNSUPPORTED_KEY_TYPE"
+  | "UNSUPPORTED_CURVE";
+
+export type PublicKeyValidation =
+  | { valid: true; derBuffer: Buffer; canonicalBase64: string; fingerprint: string }
+  | { valid: false; reason: PublicKeyInvalidReason };
+
+// Standard (non-URL-safe) Base64 alphabet, with optional padding -- matched *before* attempting
+// to decode anything, so an obviously-wrong input (whitespace, base64url `-`/`_`) is rejected with
+// a precise reason rather than falling through to a generic decode failure.
+const STANDARD_BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+
+// Validates an incoming SPKI-DER-as-Base64 public key against exactly what this stage accepts:
+// EC on the P-256 (secp256r1/prime256v1) curve, nothing else. Never throws -- every failure mode
+// (malformed Base64, malformed DER, wrong key type, wrong curve, a private key instead of a
+// public one, PEM instead of raw DER, RSA/Ed25519 keys) returns { valid: false, reason }.
+//
+// Base64 canonicality: Buffer.from(str, "base64") is lenient -- it silently drops characters it
+// doesn't understand instead of rejecting them -- so the character-set regex above is not enough
+// on its own to catch a malformed string. Re-encoding the decoded bytes and comparing the result
+// back to the exact original input string is what actually proves the input was a canonical,
+// well-formed Base64 encoding of those bytes.
+//
+// Curve check: P-256 is verified via JWK export (`crv === "P-256"`), not via
+// `asymmetricKeyDetails.namedCurve` (which returns OpenSSL's own curve alias, e.g.
+// "prime256v1", requiring the reader to already know that name *is* P-256/secp256r1). JWK's `crv`
+// value is pinned by RFC 7518 to the literal string "P-256" for this curve, which is the more
+// standards-anchored, unambiguous check to rely on.
+export function validateEcP256PublicKey(publicKeyBase64: string): PublicKeyValidation {
+  if (/\s/.test(publicKeyBase64)) {
+    return { valid: false, reason: "CONTAINS_WHITESPACE" };
+  }
+  if (publicKeyBase64.includes("-") || publicKeyBase64.includes("_")) {
+    return { valid: false, reason: "BASE64URL_VARIANT" };
+  }
+  if (!STANDARD_BASE64_PATTERN.test(publicKeyBase64)) {
+    return { valid: false, reason: "NOT_STANDARD_BASE64" };
+  }
+
+  const derBuffer = Buffer.from(publicKeyBase64, "base64");
+
+  if (derBuffer.length === 0) {
+    return { valid: false, reason: "EMPTY_AFTER_DECODE" };
+  }
+
+  if (derBuffer.toString("base64") !== publicKeyBase64) {
+    return { valid: false, reason: "NON_CANONICAL_BASE64" };
+  }
+
+  let keyObject: crypto.KeyObject;
+  try {
+    keyObject = crypto.createPublicKey({ key: derBuffer, format: "der", type: "spki" });
+  } catch {
+    return { valid: false, reason: "MALFORMED_DER" };
+  }
+
+  if (keyObject.asymmetricKeyType !== "ec") {
+    return { valid: false, reason: "UNSUPPORTED_KEY_TYPE" };
+  }
+
+  // `crv` is read into a plain local rather than naming KeyObject.export({format:"jwk"})'s own
+  // return type explicitly -- it resolves to crypto.webcrypto.JsonWebKey, which TypeScript infers
+  // fine on its own but is awkward to spell out by hand.
+  let curveName: string | undefined;
+  try {
+    curveName = keyObject.export({ format: "jwk" }).crv;
+  } catch {
+    return { valid: false, reason: "UNSUPPORTED_CURVE" };
+  }
+
+  if (curveName !== "P-256") {
+    return { valid: false, reason: "UNSUPPORTED_CURVE" };
+  }
+
+  const fingerprint = crypto.createHash("sha256").update(derBuffer).digest("hex");
+
+  return { valid: true, derBuffer, canonicalBase64: publicKeyBase64, fingerprint };
+}
+
+// Every outcome the registerDevicePublicKey transactions below can resolve to. Deliberately not
+// exceptions -- these are all *expected*, named business outcomes the caller (the
+// registerDevicePublicKey callable) maps onto specific client-facing HttpsErrors; only a genuine
+// Firestore/infrastructure failure is left to propagate as a real thrown error (see below).
+// "camera_not_claimed" is CAMERA-specific (see applyCameraPublicKeyRegistration); every other
+// outcome is shared between both roles.
+export type PublicKeyRegistrationOutcome =
+  | { outcome: "registered" }
+  | { outcome: "idempotent" }
+  | { outcome: "not_found" }
+  | { outcome: "camera_not_claimed" }
+  | { outcome: "role_mismatch" }
+  | { outcome: "auth_uid_mismatch" }
+  | { outcome: "owner_uid_mismatch" }
+  | { outcome: "revoked" }
+  | { outcome: "key_conflict" }
+  | { outcome: "corrupt" };
+
+// Same shape as PublicKeyRegistrationOutcome, but the two outcomes that require a write
+// (idempotent/registered) also carry the exact fields to write -- kept internal (not exported)
+// since callers only ever need the plain outcome; the fields are consumed immediately by
+// finalizePublicKeyRegistrationDecision below, inside the same transaction that produced them.
+type PublicKeyRegistrationDecision =
+  | { outcome: "registered"; writeFields: Record<string, unknown> }
+  | { outcome: "idempotent"; writeFields: Record<string, unknown> }
+  | { outcome: "not_found" }
+  | { outcome: "role_mismatch" }
+  | { outcome: "auth_uid_mismatch" }
+  | { outcome: "owner_uid_mismatch" }
+  | { outcome: "revoked" }
+  | { outcome: "key_conflict" }
+  | { outcome: "corrupt" };
+
+// The single, shared decision core for legacy -> keystore registration -- used by BOTH
+// applyPublicKeyRegistration (HOME) and applyCameraPublicKeyRegistration (CAMERA) so neither
+// duplicates corruption handling, revoked handling, idempotency, first-write-wins, timestamp
+// behavior, or key-conflict behavior (see docs/DEVICE_REGISTRY.md). Pure: takes an
+// already-fetched document snapshot (or null) and never touches Firestore itself -- the caller is
+// responsible for the actual read (inside its own transaction) and for applying `writeFields` via
+// that same transaction (see finalizePublicKeyRegistrationDecision below). Directly unit-testable
+// without a Firestore emulator.
+//
+// `expectedAuthUid`/`expectedOwnerUid` are supplied by the caller, already verified against
+// whatever source is appropriate for the role (HOME: request.auth.uid directly; CAMERA:
+// cameraClaims.cameraAuthUid, itself already cross-checked against request.auth.uid by the
+// caller, in the same transaction -- see applyCameraPublicKeyRegistration) -- this function only
+// ever re-verifies them against the stored document, it never derives them itself and never
+// trusts anything the client asserts about its own identity. `expectedOwnerUid: null` skips the
+// ownerUid check entirely (CAMERA's ownerUid is never used for authentication).
+function decidePublicKeyRegistration(
+  existing: RegisteredDevice | null,
+  params: { role: DeviceRole; expectedAuthUid: string; expectedOwnerUid: string | null; canonicalPublicKey: string }
+): PublicKeyRegistrationDecision {
+  if (!existing) {
+    return { outcome: "not_found" };
+  }
+
+  if (existing.role !== params.role) {
+    return { outcome: "role_mismatch" };
+  }
+  if (existing.authUid !== params.expectedAuthUid) {
+    return { outcome: "auth_uid_mismatch" };
+  }
+  if (params.expectedOwnerUid !== null && existing.ownerUid !== params.expectedOwnerUid) {
+    return { outcome: "owner_uid_mismatch" };
+  }
+  if (existing.status === "revoked") {
+    return { outcome: "revoked" };
+  }
+
+  // Never auto-repair an inconsistent document -- see docs/DEVICE_REGISTRY.md.
+  const isCorrupt =
+    (existing.identityMode === "legacy" && existing.publicKey !== null) ||
+    (existing.identityMode === "keystore" && existing.publicKey === null);
+  if (isCorrupt) {
+    return { outcome: "corrupt" };
+  }
+
+  if (existing.identityMode === "keystore") {
+    // existing.publicKey is guaranteed non-null here -- the corruption check above already ruled
+    // out identityMode:"keystore" with publicKey:null.
+    if (existing.publicKey === params.canonicalPublicKey) {
+      return { outcome: "idempotent", writeFields: { lastSeenAt: admin.firestore.FieldValue.serverTimestamp() } };
+    }
+    return { outcome: "key_conflict" };
+  }
+
+  // identityMode === "legacy" and publicKey === null (corruption already ruled out) -- the one and
+  // only first-registration path. Only identityMode/publicKey/updatedAt/lastSeenAt are ever
+  // written -- deviceId/role/authUid/ownerUid/status/suspensionReason/createdAt/revokedAt are
+  // never part of this write.
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  return {
+    outcome: "registered",
+    writeFields: { identityMode: "keystore", publicKey: params.canonicalPublicKey, updatedAt: now, lastSeenAt: now },
+  };
+}
+
+// Applies a decidePublicKeyRegistration() result inside the caller's own transaction: performs
+// the merge-write for "registered"/"idempotent" (nothing else ever writes), logs the one warning
+// a "corrupt" outcome needs (deviceId/role only -- see docs/DEVICE_REGISTRY.md), and returns the
+// plain outcome (dropping `writeFields`, an internal-only detail) for the callable to map onto an
+// HttpsError.
+function finalizePublicKeyRegistrationDecision(
+  t: admin.firestore.Transaction,
+  ref: admin.firestore.DocumentReference,
+  identity: { deviceId: string; role: DeviceRole },
+  decision: PublicKeyRegistrationDecision
+): PublicKeyRegistrationOutcome {
+  if (decision.outcome === "corrupt") {
+    logger.warn("DEVICE_REGISTRY_PUBLIC_KEY_CORRUPT", { deviceId: identity.deviceId, role: identity.role });
+  }
+  if (decision.outcome === "registered" || decision.outcome === "idempotent") {
+    t.set(ref, decision.writeFields, { merge: true });
+  }
+  return { outcome: decision.outcome };
+}
+
+// The strict, transactional legacy -> keystore registration operation for HOME. Unlike every
+// best-effort function above, this is NOT best-effort: it never catches or swallows a Firestore
+// error -- a failed transaction (contention exhausted, a genuine write failure) propagates as a
+// real rejected promise, and it is the caller's job (the callable) to turn that into a controlled
+// internal/INTERNAL response rather than silently reporting success.
+//
+// Never creates registeredDevices/{deviceId} -- registering a device and registering its
+// cryptographic identity are different operations (see docs/DEVICE_REGISTRY.md); a missing
+// document is reported back as { outcome: "not_found" }, never created here.
+//
+// CAMERA registration does NOT use this function -- see applyCameraPublicKeyRegistration, which
+// additionally verifies cameraClaims inside the same transaction as the registry read/write
+// (verifying it outside, beforehand, would leave a window where an unpair between the check and
+// the write could remove cameraClaims while the key registration still went through).
+export async function applyPublicKeyRegistration(
+  db: admin.firestore.Firestore,
+  params: {
+    deviceId: string;
+    role: DeviceRole;
+    expectedAuthUid: string;
+    expectedOwnerUid: string | null;
+    canonicalPublicKey: string;
+  }
+): Promise<PublicKeyRegistrationOutcome> {
+  const ref = registeredDeviceRef(db, params.deviceId);
+
+  return db.runTransaction(async (t): Promise<PublicKeyRegistrationOutcome> => {
+    const snap = await t.get(ref);
+    const existing = snap.exists ? (snap.data() as RegisteredDevice) : null;
+    const decision = decidePublicKeyRegistration(existing, params);
+    return finalizePublicKeyRegistrationDecision(t, ref, { deviceId: params.deviceId, role: params.role }, decision);
+  });
+}
+
+// The strict, transactional legacy -> keystore registration operation for CAMERA. Reads
+// cameraClaims/{cameraDeviceId} AND registeredDevices/{cameraDeviceId} inside the SAME
+// transaction as the eventual write -- unlike an out-of-transaction pre-check, this makes the
+// whole "claim still exists and matches, therefore the key may be registered" decision atomic
+// with the write itself: a concurrent unpair (which deletes cameraClaims) can no longer race
+// between "verified" and "written", because both reads and the write share one transaction and
+// Firestore's own contention/retry guarantees a consistent view throughout.
+//
+// `authenticatedUid` is `request.auth.uid` as already verified by the callable (a real
+// Firebase Auth session existed) -- never anything the client asserts about its own identity
+// beyond that. Never reveals the expected/actual uid or any claim contents to the caller; only
+// the fixed outcome enum crosses this function's boundary.
+//
+// Same never-swallows-Firestore-errors contract as applyPublicKeyRegistration, and reuses the
+// exact same decidePublicKeyRegistration()/finalizePublicKeyRegistrationDecision() core, so
+// corruption handling, revoked handling, idempotency, first-write-wins, timestamp behavior, and
+// key-conflict behavior are identical between the two roles -- never duplicated.
+export async function applyCameraPublicKeyRegistration(
+  db: admin.firestore.Firestore,
+  params: {
+    cameraDeviceId: string;
+    authenticatedUid: string;
+    canonicalPublicKey: string;
+  }
+): Promise<PublicKeyRegistrationOutcome> {
+  const claimRef = db.collection("cameraClaims").doc(params.cameraDeviceId);
+  const ref = registeredDeviceRef(db, params.cameraDeviceId);
+
+  return db.runTransaction(async (t): Promise<PublicKeyRegistrationOutcome> => {
+    const claimSnap = await t.get(claimRef);
+    if (!claimSnap.exists) {
+      return { outcome: "camera_not_claimed" };
+    }
+
+    const cameraAuthUid = claimSnap.get("cameraAuthUid") as string | undefined;
+    if (!cameraAuthUid || cameraAuthUid !== params.authenticatedUid) {
+      return { outcome: "auth_uid_mismatch" };
+    }
+
+    const snap = await t.get(ref);
+    const existing = snap.exists ? (snap.data() as RegisteredDevice) : null;
+    const decision = decidePublicKeyRegistration(existing, {
+      role: "CAMERA",
+      expectedAuthUid: cameraAuthUid,
+      expectedOwnerUid: null,
+      canonicalPublicKey: params.canonicalPublicKey,
+    });
+    return finalizePublicKeyRegistrationDecision(t, ref, { deviceId: params.cameraDeviceId, role: "CAMERA" }, decision);
+  });
 }

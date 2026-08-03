@@ -17,6 +17,10 @@ const {
   submitCameraEvent,
   releaseCameraForUser,
   releaseCameraFromCamera,
+  registerDevicePublicKey,
+  validateEcP256PublicKey,
+  applyPublicKeyRegistration,
+  applyCameraPublicKeyRegistration,
 } = require("../lib/index.js");
 const admin = require("firebase-admin");
 
@@ -539,4 +543,864 @@ test("submitCameraEvent (no conflict) attaches the correct ownerUid from cameraC
   const data = (await registryRef(CAMERA_ID).get()).data();
   assert.equal(data.authUid, CAMERA_AUTH_UID);
   assert.equal(data.ownerUid, OWNER_UID);
+});
+
+// =================================================================================================
+// registerDevicePublicKey -- Android Keystore identity (legacy -> keystore)
+// =================================================================================================
+// Uses its own dedicated ids/uids throughout (never CAMERA_ID/HOME_DEVICE_ID/OWNER_UID/
+// CAMERA_AUTH_UID from earlier in this file) so this section's outcome never depends on what ran
+// before it -- exactly the lesson the "idempotent claim" test fix elsewhere in this file already
+// established about shared constants leaking cameraCount state across tests.
+
+const KEY_TEST_CAMERA_ID = "camera-keystore-test";
+const KEY_TEST_HOME_ID = "home-keystore-test";
+const KEY_TEST_OWNER_UID = "keystore-owner-uid";
+const KEY_TEST_OTHER_UID = "keystore-other-uid";
+const KEY_TEST_CAMERA_AUTH_UID = "keystore-camera-auth-uid";
+const KEY_TEST_OTHER_CAMERA_AUTH_UID = "keystore-other-camera-auth-uid";
+
+function keyTestClaimRef() {
+  return db.collection("cameraClaims").doc(KEY_TEST_CAMERA_ID);
+}
+
+test.afterEach(async () => {
+  await registryRef(KEY_TEST_CAMERA_ID).delete();
+  await registryRef(KEY_TEST_HOME_ID).delete();
+  await keyTestClaimRef().delete();
+});
+
+async function seedKeyTestDevice(deviceId, overrides = {}) {
+  const now = admin.firestore.Timestamp.now();
+  await registryRef(deviceId).set({
+    schemaVersion: 1,
+    deviceId,
+    role: "CAMERA",
+    authUid: KEY_TEST_CAMERA_AUTH_UID,
+    ownerUid: KEY_TEST_OWNER_UID,
+    status: "active",
+    suspensionReason: null,
+    identityMode: "legacy",
+    publicKey: null,
+    createdAt: now,
+    updatedAt: now,
+    lastSeenAt: now,
+    revokedAt: null,
+    ...overrides,
+  });
+}
+
+// --- test key material, generated fresh per test run -- never a static/committed private key ----
+
+function derToBase64(keyObject) {
+  return keyObject.export({ format: "der", type: "spki" }).toString("base64");
+}
+
+function generateP256PublicKeyBase64() {
+  return derToBase64(crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" }).publicKey);
+}
+
+function generateRsaPublicKeyBase64() {
+  return crypto
+    .generateKeyPairSync("rsa", { modulusLength: 2048 })
+    .publicKey.export({ format: "der", type: "spki" })
+    .toString("base64");
+}
+
+function generateWrongCurvePublicKeyBase64() {
+  return derToBase64(crypto.generateKeyPairSync("ec", { namedCurve: "secp384r1" }).publicKey);
+}
+
+function generateP256PrivateKeyDerBase64() {
+  return crypto
+    .generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+    .privateKey.export({ format: "der", type: "pkcs8" })
+    .toString("base64");
+}
+
+// --- request validation (1-11) -------------------------------------------------------------------
+
+test("registerDevicePublicKey: 1. unauthenticated request rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        undefined
+      )
+    ),
+    (err) => err.code === "unauthenticated"
+  );
+});
+
+test("registerDevicePublicKey: 2. malformed deviceId (blank after trim) rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: "   ", role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_DEVICE_ID"
+  );
+});
+
+test("registerDevicePublicKey: malformed deviceId (over 128 chars) rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: "x".repeat(129), role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_DEVICE_ID"
+  );
+});
+
+test("registerDevicePublicKey: 3. invalid role rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "ADMIN", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_ROLE"
+  );
+});
+
+test("registerDevicePublicKey: 4. unsupported algorithm rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "RS256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_ALGORITHM"
+  );
+});
+
+test("registerDevicePublicKey: 5. empty publicKey rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: "", algorithm: "ES256" }, KEY_TEST_CAMERA_AUTH_UID)
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_PUBLIC_KEY"
+  );
+});
+
+test("registerDevicePublicKey: 6. oversized publicKey rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: "A".repeat(513), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_PUBLIC_KEY"
+  );
+});
+
+test("registerDevicePublicKey: 7. whitespace-containing Base64 rejected", async () => {
+  const withWhitespace = `${generateP256PublicKeyBase64()}\n`;
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: withWhitespace, algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_PUBLIC_KEY"
+  );
+});
+
+test("registerDevicePublicKey: 8. Base64URL variant rejected", async () => {
+  const std = generateP256PublicKeyBase64();
+  const base64url = `-${std.slice(1)}`; // forces a base64url-only character regardless of the random key's own bytes
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: base64url, algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_PUBLIC_KEY"
+  );
+});
+
+test("registerDevicePublicKey: 9. malformed DER rejected", async () => {
+  const notDer = Buffer.from("this is definitely not a valid SPKI DER structure").toString("base64");
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: notDer, algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_PUBLIC_KEY"
+  );
+});
+
+test("registerDevicePublicKey: 10. RSA public key rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateRsaPublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_PUBLIC_KEY"
+  );
+});
+
+test("registerDevicePublicKey: 11. EC key on the wrong curve rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        {
+          deviceId: KEY_TEST_CAMERA_ID,
+          role: "CAMERA",
+          publicKey: generateWrongCurvePublicKeyBase64(),
+          algorithm: "ES256",
+        },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_PUBLIC_KEY"
+  );
+});
+
+test("registerDevicePublicKey: a private key (PKCS8 DER) instead of a public SPKI key is rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        {
+          deviceId: KEY_TEST_CAMERA_ID,
+          role: "CAMERA",
+          publicKey: generateP256PrivateKeyDerBase64(),
+          algorithm: "ES256",
+        },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_PUBLIC_KEY"
+  );
+});
+
+// --- 12-21: authorization and registry-document preconditions -----------------------------------
+
+test("registerDevicePublicKey: 12. valid P-256 SPKI is accepted", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  const response = await registerDevicePublicKey.run(
+    fakeRequest(
+      { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+      KEY_TEST_CAMERA_AUTH_UID
+    )
+  );
+
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+});
+
+test("registerDevicePublicKey: 13. missing registry document rejected (HOME)", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID
+      )
+    ),
+    (err) => err.code === "not-found" && err.message === "DEVICE_NOT_REGISTERED"
+  );
+});
+
+test("registerDevicePublicKey: missing registry document rejected (CAMERA, cameraClaims present)", async () => {
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "not-found" && err.message === "DEVICE_NOT_REGISTERED"
+  );
+});
+
+test("registerDevicePublicKey: 14. HOME with matching authUid/ownerUid succeeds", async () => {
+  await seedKeyTestDevice(KEY_TEST_HOME_ID, {
+    role: "HOME",
+    authUid: KEY_TEST_OWNER_UID,
+    ownerUid: KEY_TEST_OWNER_UID,
+  });
+
+  const response = await registerDevicePublicKey.run(
+    fakeRequest(
+      { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+      KEY_TEST_OWNER_UID
+    )
+  );
+
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+});
+
+test("registerDevicePublicKey: 15. HOME authUid mismatch rejected", async () => {
+  await seedKeyTestDevice(KEY_TEST_HOME_ID, {
+    role: "HOME",
+    authUid: KEY_TEST_OWNER_UID,
+    ownerUid: KEY_TEST_OWNER_UID,
+  });
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OTHER_UID
+      )
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_IDENTITY_MISMATCH"
+  );
+});
+
+test("registerDevicePublicKey: 16. HOME ownerUid mismatch rejected", async () => {
+  // authUid matches the caller, but ownerUid on the stored document does not -- an inconsistent
+  // state that must still be rejected (ownerUid is part of HOME's authorization too).
+  await seedKeyTestDevice(KEY_TEST_HOME_ID, {
+    role: "HOME",
+    authUid: KEY_TEST_OWNER_UID,
+    ownerUid: KEY_TEST_OTHER_UID,
+  });
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID
+      )
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_IDENTITY_MISMATCH"
+  );
+});
+
+test("registerDevicePublicKey: 17. CAMERA without cameraClaims rejected", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "not-found" && err.message === "CAMERA_NOT_CLAIMED"
+  );
+});
+
+test("registerDevicePublicKey: 18. CAMERA with matching cameraAuthUid succeeds", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  const response = await registerDevicePublicKey.run(
+    fakeRequest(
+      { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+      KEY_TEST_CAMERA_AUTH_UID
+    )
+  );
+
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+});
+
+test("registerDevicePublicKey: 19. CAMERA registration called by the Home owner is rejected", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID // the linked Home owner, not the Camera's own auth identity
+      )
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_IDENTITY_MISMATCH"
+  );
+});
+
+test("registerDevicePublicKey: 20. registry role conflict rejected", async () => {
+  // Registered as HOME, but the request claims CAMERA for the same deviceId.
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID, {
+    role: "HOME",
+    authUid: KEY_TEST_CAMERA_AUTH_UID,
+    ownerUid: KEY_TEST_CAMERA_AUTH_UID,
+  });
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_IDENTITY_MISMATCH"
+  );
+});
+
+test("registerDevicePublicKey: 21. registry authUid conflict (drifted from cameraClaims) rejected", async () => {
+  // The registry's own authUid disagrees with cameraClaims.cameraAuthUid -- defense in depth, see
+  // applyPublicKeyRegistration's own authUid check.
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID, { authUid: KEY_TEST_OTHER_CAMERA_AUTH_UID });
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_IDENTITY_MISMATCH"
+  );
+});
+
+// Field-by-field comparison rather than assert.deepEqual(before, after): Firestore Timestamp
+// objects are compared via their own .isEqual() elsewhere in this file (deepEqual's structural
+// comparison is not a documented-safe way to compare two separately-read Timestamp instances).
+function assertRegistryDocUnchanged(before, after) {
+  assert.equal(after.deviceId, before.deviceId);
+  assert.equal(after.role, before.role);
+  assert.equal(after.authUid, before.authUid);
+  assert.equal(after.ownerUid, before.ownerUid);
+  assert.equal(after.status, before.status);
+  assert.equal(after.suspensionReason, before.suspensionReason);
+  assert.equal(after.identityMode, before.identityMode);
+  assert.equal(after.publicKey, before.publicKey);
+  assert.equal(after.revokedAt, before.revokedAt);
+  assert.equal(after.createdAt.isEqual(before.createdAt), true);
+  assert.equal(after.updatedAt.isEqual(before.updatedAt), true);
+  assert.equal(after.lastSeenAt.isEqual(before.lastSeenAt), true);
+}
+
+// --- CAMERA authorization atomicity fix ----------------------------------------------------------
+// applyCameraPublicKeyRegistration() reads cameraClaims AND registeredDevices inside the SAME
+// Firestore transaction as the eventual write -- fixing a real race where an out-of-transaction
+// pre-check of cameraClaims could be invalidated by a concurrent unpair before the (separate)
+// registry transaction committed. True concurrent-timing tests of "did the two reads happen inside
+// exactly the same transaction" would need to inject a delay/hook into the transaction callback
+// itself (heavier test infrastructure than this project uses elsewhere) -- what's tested below
+// instead is the deterministic, directly observable consequence: the claim check is always read
+// live at call time (never a cached/pre-fetched value passed in from outside), and no path ever
+// mutates the registry document without the claim check having *just* passed inside that same
+// call.
+
+test("registerDevicePublicKey: CAMERA claim and registry are read together -- a claim deleted right before the call is seen immediately, not from a stale earlier check", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  // Simulates unpair happening before this specific registration attempt (as opposed to the
+  // previously-possible window between an earlier out-of-transaction pre-check and a later,
+  // separate registry transaction) -- there is no separate pre-check left to go stale.
+  await keyTestClaimRef().delete();
+
+  const before = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "not-found" && err.message === "CAMERA_NOT_CLAIMED"
+  );
+
+  const after = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  assert.equal(after.identityMode, "legacy", "the registry must be completely unaffected");
+  assert.equal(after.publicKey, before.publicKey);
+  assert.equal(after.updatedAt.isEqual(before.updatedAt), true);
+});
+
+test("registerDevicePublicKey: applyCameraPublicKeyRegistration() itself reports camera_not_claimed and never touches the registry when cameraClaims is absent", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  const before = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  // Deliberately no cameraClaims document at all.
+
+  const result = await applyCameraPublicKeyRegistration(db, {
+    cameraDeviceId: KEY_TEST_CAMERA_ID,
+    authenticatedUid: KEY_TEST_CAMERA_AUTH_UID,
+    canonicalPublicKey: generateP256PublicKeyBase64(),
+  });
+
+  assert.deepEqual(result, { outcome: "camera_not_claimed" });
+  const after = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  assertRegistryDocUnchanged(before, after);
+});
+
+test("registerDevicePublicKey: a mismatched cameraAuthUid inside the same transaction leaves the registry completely unchanged", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+  const before = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OTHER_CAMERA_AUTH_UID // authenticated, but not the uid recorded on the claim
+      )
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_IDENTITY_MISMATCH"
+  );
+
+  const after = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  assertRegistryDocUnchanged(before, after);
+});
+
+test("registerDevicePublicKey: CAMERA without cameraClaims leaves an existing registry document completely unchanged", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  const before = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  // Deliberately no cameraClaims document at all.
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "not-found" && err.message === "CAMERA_NOT_CLAIMED"
+  );
+
+  const after = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  assertRegistryDocUnchanged(before, after);
+});
+
+// --- 22-31: transaction / status / idempotency / conflict / corruption behavior ------------------
+
+test("registerDevicePublicKey: 22. first registration updates only identityMode/publicKey/updatedAt/lastSeenAt", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+  const before = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+
+  const publicKey = generateP256PublicKeyBase64();
+  await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey, algorithm: "ES256" }, KEY_TEST_CAMERA_AUTH_UID)
+  );
+
+  const after = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  assert.equal(after.identityMode, "keystore");
+  assert.equal(after.publicKey, publicKey);
+  assert.equal(after.updatedAt.isEqual(before.updatedAt), false);
+  assert.equal(after.lastSeenAt.isEqual(before.lastSeenAt), false);
+
+  // Everything else is byte-for-byte unchanged.
+  assert.equal(after.deviceId, before.deviceId);
+  assert.equal(after.role, before.role);
+  assert.equal(after.authUid, before.authUid);
+  assert.equal(after.ownerUid, before.ownerUid);
+  assert.equal(after.status, before.status);
+  assert.equal(after.suspensionReason, before.suspensionReason);
+  assert.equal(after.createdAt.isEqual(before.createdAt), true);
+  assert.equal(after.revokedAt, before.revokedAt);
+});
+
+test("registerDevicePublicKey: 23. active status is preserved through registration", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID, { status: "active" });
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  await registerDevicePublicKey.run(
+    fakeRequest(
+      { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+      KEY_TEST_CAMERA_AUTH_UID
+    )
+  );
+
+  assert.equal((await registryRef(KEY_TEST_CAMERA_ID).get()).data().status, "active");
+});
+
+test("registerDevicePublicKey: 24. suspended status and suspensionReason are preserved, registration still succeeds", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID, { status: "suspended", suspensionReason: "manual" });
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  const response = await registerDevicePublicKey.run(
+    fakeRequest(
+      { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+      KEY_TEST_CAMERA_AUTH_UID
+    )
+  );
+
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+  const data = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  assert.equal(data.status, "suspended");
+  assert.equal(data.suspensionReason, "manual");
+  assert.equal(data.identityMode, "keystore");
+});
+
+test("registerDevicePublicKey: 25. revoked device is rejected and left unchanged", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID, { status: "revoked", revokedAt: admin.firestore.Timestamp.now() });
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+  const before = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "DEVICE_REVOKED"
+  );
+
+  const after = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  assert.equal(after.identityMode, "legacy");
+  assert.equal(after.publicKey, null);
+  assert.equal(after.updatedAt.isEqual(before.updatedAt), true);
+});
+
+test("registerDevicePublicKey: 26/27/28. repeated same-key registration is idempotent, createdAt/updatedAt unchanged", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  const publicKey = generateP256PublicKeyBase64();
+  const request = () =>
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey, algorithm: "ES256" }, KEY_TEST_CAMERA_AUTH_UID)
+    );
+
+  const firstResponse = await request();
+  const afterFirst = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+
+  const secondResponse = await request();
+  const afterSecond = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+
+  assert.deepEqual(firstResponse, { success: true, identityMode: "keystore" });
+  assert.deepEqual(secondResponse, { success: true, identityMode: "keystore" });
+  assert.equal(afterSecond.publicKey, publicKey);
+  assert.equal(afterSecond.createdAt.isEqual(afterFirst.createdAt), true);
+  assert.equal(afterSecond.updatedAt.isEqual(afterFirst.updatedAt), true, "updatedAt must not change on an idempotent repeat");
+  assert.equal(afterSecond.lastSeenAt.isEqual(afterFirst.lastSeenAt), false, "lastSeenAt should still be refreshed");
+});
+
+test("registerDevicePublicKey: 29. a different-key replacement attempt is rejected and the stored key is unchanged", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  const firstKey = generateP256PublicKeyBase64();
+  await registerDevicePublicKey.run(
+    fakeRequest(
+      { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: firstKey, algorithm: "ES256" },
+      KEY_TEST_CAMERA_AUTH_UID
+    )
+  );
+
+  const secondKey = generateP256PublicKeyBase64();
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: secondKey, algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "PUBLIC_KEY_ALREADY_REGISTERED"
+  );
+
+  assert.equal((await registryRef(KEY_TEST_CAMERA_ID).get()).data().publicKey, firstKey);
+});
+
+test("registerDevicePublicKey: 30. legacy + non-null publicKey is treated as corrupt, not auto-fixed", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID, { identityMode: "legacy", publicKey: "unexpected-non-null-value" });
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "DEVICE_IDENTITY_CORRUPT"
+  );
+
+  const after = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  assert.equal(after.identityMode, "legacy");
+  assert.equal(after.publicKey, "unexpected-non-null-value");
+});
+
+test("registerDevicePublicKey: 31. keystore + null publicKey is treated as corrupt, not auto-fixed", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID, { identityMode: "keystore", publicKey: null });
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "DEVICE_IDENTITY_CORRUPT"
+  );
+
+  const after = (await registryRef(KEY_TEST_CAMERA_ID).get()).data();
+  assert.equal(after.identityMode, "keystore");
+  assert.equal(after.publicKey, null);
+});
+
+// --- 32/33: concurrent registration ---------------------------------------------------------------
+
+test("registerDevicePublicKey: 32. two concurrent same-key requests both succeed, exactly one stored key", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  const publicKey = generateP256PublicKeyBase64();
+  const makeRequest = () =>
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey, algorithm: "ES256" }, KEY_TEST_CAMERA_AUTH_UID)
+    );
+
+  const [first, second] = await Promise.all([makeRequest(), makeRequest()]);
+
+  assert.deepEqual(first, { success: true, identityMode: "keystore" });
+  assert.deepEqual(second, { success: true, identityMode: "keystore" });
+  assert.equal((await registryRef(KEY_TEST_CAMERA_ID).get()).data().publicKey, publicKey);
+});
+
+test("registerDevicePublicKey: 33. two concurrent different-key requests leave only one stored key", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  const keyA = generateP256PublicKeyBase64();
+  const keyB = generateP256PublicKeyBase64();
+
+  const results = await Promise.allSettled([
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: keyA, algorithm: "ES256" }, KEY_TEST_CAMERA_AUTH_UID)
+    ),
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: keyB, algorithm: "ES256" }, KEY_TEST_CAMERA_AUTH_UID)
+    ),
+  ]);
+
+  const fulfilled = results.filter((r) => r.status === "fulfilled");
+  const rejected = results.filter((r) => r.status === "rejected");
+
+  // Firestore's own optimistic-concurrency transaction retry guarantees exactly one write wins --
+  // never a last-write-wins replacement of the other's key.
+  assert.equal(fulfilled.length, 1, "exactly one request must succeed");
+  assert.equal(rejected.length, 1, "the other must be rejected, never silently overwritten");
+  assert.equal(rejected[0].reason.message, "PUBLIC_KEY_ALREADY_REGISTERED");
+
+  const finalKey = (await registryRef(KEY_TEST_CAMERA_ID).get()).data().publicKey;
+  assert.ok(finalKey === keyA || finalKey === keyB, "the stored key must be exactly one of the two submitted keys");
+});
+
+// --- 34/35: logging never leaks the key or the caller's uid --------------------------------------
+
+async function captureStdio(fn) {
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  const lines = [];
+  process.stdout.write = (chunk, ...args) => {
+    lines.push(String(chunk));
+    return originalStdoutWrite(chunk, ...args);
+  };
+  process.stderr.write = (chunk, ...args) => {
+    lines.push(String(chunk));
+    return originalStderrWrite(chunk, ...args);
+  };
+  try {
+    await fn();
+  } finally {
+    process.stdout.write = originalStdoutWrite;
+    process.stderr.write = originalStderrWrite;
+  }
+  return lines.join("\n");
+}
+
+test("registerDevicePublicKey: 34/35. logs never contain the raw publicKey or request.auth.uid", async () => {
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  const publicKey = generateP256PublicKeyBase64();
+  const output = await captureStdio(async () => {
+    await registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey, algorithm: "ES256" }, KEY_TEST_CAMERA_AUTH_UID)
+    );
+  });
+
+  assert.ok(output.includes("REGISTER_DEVICE_PUBLIC_KEY_SUCCESS"), "the success log line should still fire");
+  assert.ok(!output.includes(publicKey), "raw publicKey must never be logged");
+  assert.ok(!output.includes(KEY_TEST_CAMERA_AUTH_UID), "the caller's request.auth.uid must never be logged");
+  assert.ok(!output.includes(KEY_TEST_OWNER_UID), "ownerUid must never be logged");
+});
+
+test("registerDevicePublicKey: an invalid-key rejection log never contains the raw (invalid) key either", async () => {
+  const notDer = Buffer.from("still not a valid SPKI DER structure").toString("base64");
+
+  const output = await captureStdio(async () => {
+    await assert.rejects(
+      registerDevicePublicKey.run(
+        fakeRequest(
+          { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: notDer, algorithm: "ES256" },
+          KEY_TEST_CAMERA_AUTH_UID
+        )
+      )
+    );
+  });
+
+  assert.ok(output.includes("REGISTER_DEVICE_PUBLIC_KEY_INVALID"));
+  assert.ok(!output.includes(notDer), "the raw (invalid) key must not be logged even on rejection");
+  assert.ok(!output.includes(KEY_TEST_CAMERA_AUTH_UID));
+});
+
+// --- 36: a genuine Firestore failure is never swallowed as success -------------------------------
+// Exercised directly against applyPublicKeyRegistration() (the layer that actually owns this
+// guarantee -- see its own doc) with a minimal fake `db` whose runTransaction() rejects, rather
+// than against the full callable: there is no dependency-injection point for admin.firestore()
+// inside the real registerDevicePublicKey callable, and reaching for a mocking library just to
+// fake a network-level Firestore outage would be exactly the "heavy new test infrastructure" this
+// project avoids. This still directly proves the property in question: a rejected transaction
+// propagates as a rejected promise, never as a fabricated success.
+
+test("registerDevicePublicKey: 36. a Firestore transaction failure propagates, it is never swallowed as success", async () => {
+  const fakeDb = {
+    collection: () => ({ doc: () => ({}) }),
+    runTransaction: async () => {
+      throw new Error("simulated Firestore outage");
+    },
+  };
+
+  await assert.rejects(
+    applyPublicKeyRegistration(fakeDb, {
+      deviceId: KEY_TEST_CAMERA_ID,
+      role: "CAMERA",
+      expectedAuthUid: KEY_TEST_CAMERA_AUTH_UID,
+      expectedOwnerUid: null,
+      canonicalPublicKey: generateP256PublicKeyBase64(),
+    }),
+    (err) => err.message === "simulated Firestore outage"
+  );
+});
+
+// --- validateEcP256PublicKey: a few direct, fast unit checks on the pure validator itself --------
+
+test("validateEcP256PublicKey: accepts a real P-256 SPKI key and computes a lowercase-hex fingerprint", () => {
+  const publicKey = generateP256PublicKeyBase64();
+  const result = validateEcP256PublicKey(publicKey);
+
+  assert.equal(result.valid, true);
+  assert.equal(result.canonicalBase64, publicKey);
+  assert.match(result.fingerprint, /^[0-9a-f]{64}$/);
+});
+
+test("validateEcP256PublicKey: rejects non-canonical Base64 (same decoded bytes, different re-encoding)", () => {
+  // Buffer.from([0xff]).toString("base64") canonically encodes to "/w==" -- the last quartet's
+  // unused low bits are zero in a canonical encoding. "/x==" decodes to that exact same single
+  // byte (0xff) under a lenient decoder (only the meaningful top bits are read), but is not what
+  // re-encoding that byte actually produces -- exactly the non-canonical case this check exists to
+  // catch. A general Base64-canonicality property, not specific to EC keys, so a trivial 1-byte
+  // example is used here instead of hand-corrupting a real ~91-byte SPKI key (whose own trailing
+  // quartet position would need the same reasoning applied, but is harder to verify by hand).
+  const result = validateEcP256PublicKey("/x==");
+
+  assert.equal(result.valid, false);
+  assert.equal(result.reason, "NON_CANONICAL_BASE64");
 });
