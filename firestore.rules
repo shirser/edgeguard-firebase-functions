@@ -125,6 +125,15 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // deviceChallenges: device-signature challenge protocol (see functions/src/deviceChallenges.ts).
+    // Functions (Admin SDK) only, both directions -- mirrors cameraClaims/cameraPairingSessions/
+    // registeredDevices exactly. Created by createDeviceChallenge and, in a later sub-task,
+    // consumed (usedAt set) by whichever callable verifies a signed device proof. No client may
+    // ever read a challenge's nonce/requestHash or write/tamper with usedAt directly.
+    match /deviceChallenges/{challengeId} {
+      allow read, write: if false;
+    }
+
     // cameraLinks: only the linked Home (uid) or linked Camera (cameraAuthUid)
     // identity for that specific cameraDeviceId — never "any authenticated user".
     match /cameraLinks/{cameraDeviceId} {

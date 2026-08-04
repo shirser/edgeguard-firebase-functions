@@ -1206,3 +1206,58 @@ describe("registeredDevices", () => {
     await assertFails(deleteDoc(doc(homeDb(testEnv), "registeredDevices", CAMERA_ID)));
   });
 });
+
+// deviceChallenges: device-signature challenge protocol (see functions/src/deviceChallenges.ts).
+// Functions (Admin SDK) only in both directions, mirroring cameraClaims/cameraPairingSessions/
+// registeredDevices exactly -- no client, including the device that owns the challenge, may read
+// or write it.
+describe("deviceChallenges", () => {
+  const CHALLENGE_ID = "challenge-1";
+
+  const validChallengeDoc = () => ({
+    schemaVersion: 1,
+    challengeId: CHALLENGE_ID,
+    deviceId: CAMERA_ID,
+    role: "CAMERA",
+    authUid: CAMERA_UID,
+    purpose: "TURN_CREDENTIALS",
+    nonce: "a".repeat(43),
+    requestHash: "b".repeat(64),
+    createdAt: new Date(),
+    expiresAt: new Date(Date.now() + 90 * 1000),
+    usedAt: null,
+    usedByFunction: null,
+  });
+
+  beforeEach(async () => {
+    await seedDoc(testEnv, ["deviceChallenges", CHALLENGE_ID], validChallengeDoc());
+  });
+
+  it("an unauthenticated client cannot read", async () => {
+    await assertFails(getDoc(doc(unauthedDb(testEnv), "deviceChallenges", CHALLENGE_ID)));
+  });
+
+  it("the device that owns the challenge cannot read it", async () => {
+    await assertFails(getDoc(doc(cameraDb(testEnv), "deviceChallenges", CHALLENGE_ID)));
+  });
+
+  it("another authenticated user cannot read it either", async () => {
+    await assertFails(getDoc(doc(strangerDb(testEnv), "deviceChallenges", CHALLENGE_ID)));
+  });
+
+  it("a client cannot create a challenge document", async () => {
+    await assertFails(
+      setDoc(doc(homeDb(testEnv), "deviceChallenges", "client-created"), validChallengeDoc())
+    );
+  });
+
+  it("a client cannot update a challenge document (e.g. forge usedAt)", async () => {
+    await assertFails(
+      updateDoc(doc(cameraDb(testEnv), "deviceChallenges", CHALLENGE_ID), { usedAt: new Date() })
+    );
+  });
+
+  it("a client cannot delete a challenge document", async () => {
+    await assertFails(deleteDoc(doc(cameraDb(testEnv), "deviceChallenges", CHALLENGE_ID)));
+  });
+});

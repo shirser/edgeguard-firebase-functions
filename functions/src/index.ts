@@ -20,6 +20,19 @@ import {
   reconcileUserDeviceLimits,
 } from "./deviceRegistry";
 import type { PublicKeyRegistrationOutcome, RegisteredDevice, RevokeDeviceDecision } from "./deviceRegistry";
+import {
+  DEVICE_CHALLENGE_PURPOSES,
+  isDeviceChallengePurpose,
+  validateTurnCredentialsRequestPayload,
+  buildCanonicalTurnCredentialsRequestPayload,
+  sha256Hex,
+  buildCanonicalDeviceProofPayload,
+  generateChallengeNonce,
+  checkDeviceChallengeEligibility,
+  buildDeviceChallengeDocument,
+  CHALLENGE_TTL_SECONDS,
+} from "./deviceChallenges";
+import type { DeviceChallengePurpose } from "./deviceChallenges";
 
 admin.initializeApp();
 
@@ -78,6 +91,33 @@ export type {
   AuthTimeFreshnessReason,
   AuthTimeFreshnessResult,
 } from "./deviceRegistry";
+
+export {
+  DEVICE_CHALLENGE_PURPOSES,
+  isDeviceChallengePurpose,
+  validateTurnCredentialsRequestPayload,
+  buildCanonicalTurnCredentialsRequestPayload,
+  sha256Hex,
+  buildCanonicalDeviceProofPayload,
+  generateChallengeNonce,
+  checkDeviceChallengeEligibility,
+  buildDeviceChallengeDocument,
+  CHALLENGE_NONCE_BYTE_LENGTH,
+  CHALLENGE_TTL_SECONDS,
+  DEVICE_CHALLENGE_SCHEMA_VERSION,
+  DEVICE_PROOF_MAX_BYTES,
+} from "./deviceChallenges";
+export type {
+  DeviceChallengePurpose,
+  TurnChallengePurpose,
+  TurnCredentialsChallengeRequestPayload,
+  RequestPayloadInvalidReason,
+  TurnCredentialsRequestPayloadValidation,
+  DeviceChallengeEligibilityReason,
+  DeviceChallengeEligibilityDecision,
+  CanonicalDeviceProofFields,
+  DeviceChallengeDocument,
+} from "./deviceChallenges";
 
 function hashSecret(secret: string): string {
   return crypto.createHash("sha256").update(secret).digest("hex");
@@ -1434,6 +1474,187 @@ export const registerDevicePublicKey = onCall(
       default:
         throw new HttpsError("internal", "INTERNAL");
     }
+  }
+);
+
+// ---------------------------------------------------------------------------------------------
+// Device-signature challenge protocol -- foundation stage (createDeviceChallenge only).
+// ---------------------------------------------------------------------------------------------
+// Issues a deviceChallenges/{challengeId} document for an already-registered (identityMode:
+// "keystore") HOME or CAMERA device to later sign. This stage does NOT accept or verify a
+// signature, does NOT consume a challenge (usedAt stays null forever at this stage), and does NOT
+// change getTurnCredentials in any way -- getTurnCredentials keeps working exactly as before, and
+// no existing client is affected. See functions/src/deviceChallenges.ts for the pure
+// types/validation/canonicalization this callable orchestrates.
+//
+// role and authUid are never accepted from the client: authUid is always request.auth.uid, and
+// role is always read from registeredDevices/{deviceId}.role -- request.data itself is restricted
+// to exactly {deviceId, purpose, requestPayload}, so a client cannot smuggle in a role, authUid,
+// requestHash, nonce, expiresAt, canonicalPayload, or publicKey field to influence what gets
+// signed/stored.
+const CREATE_DEVICE_CHALLENGE_ALLOWED_REQUEST_KEYS = ["deviceId", "purpose", "requestPayload"];
+
+export const createDeviceChallenge = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+    const authUid = request.auth.uid;
+
+    if (
+      typeof request.data !== "object" ||
+      request.data === null ||
+      Object.keys(request.data as object).some((key) => !CREATE_DEVICE_CHALLENGE_ALLOWED_REQUEST_KEYS.includes(key))
+    ) {
+      throw new HttpsError("invalid-argument", "INVALID_REQUEST");
+    }
+
+    const { deviceId, purpose, requestPayload } = request.data as {
+      deviceId?: string;
+      purpose?: string;
+      requestPayload?: unknown;
+    };
+
+    if (typeof deviceId !== "string" || deviceId.trim().length === 0 || deviceId.length > MAX_DEVICE_ID_LENGTH) {
+      throw new HttpsError("invalid-argument", "INVALID_DEVICE_ID");
+    }
+
+    if (!isDeviceChallengePurpose(purpose)) {
+      throw new HttpsError("invalid-argument", "INVALID_PURPOSE");
+    }
+
+    logger.info("DEVICE_CHALLENGE_CREATE_START", { deviceId, purpose });
+
+    // Only TURN_CREDENTIALS exists today -- isDeviceChallengePurpose already narrows `purpose` to
+    // the single member of DeviceChallengePurpose. Written as a purpose-specific branch anyway so
+    // a second purpose can be added later without restructuring this function.
+    const payloadValidation = validateTurnCredentialsRequestPayload(requestPayload);
+    if (!payloadValidation.valid) {
+      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, purpose, reason: payloadValidation.reason });
+      throw new HttpsError("invalid-argument", "INVALID_REQUEST_PAYLOAD");
+    }
+    const turnRequestPayload = payloadValidation.payload;
+    const { cameraDeviceId, turnPurpose } = turnRequestPayload;
+
+    const db = admin.firestore();
+
+    const deviceSnap = await db.collection("registeredDevices").doc(deviceId).get();
+    const existingDevice = deviceSnap.exists ? (deviceSnap.data() as RegisteredDevice) : null;
+
+    const eligibility = checkDeviceChallengeEligibility(existingDevice, authUid);
+    if (!eligibility.eligible) {
+      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
+        deviceId,
+        purpose,
+        cameraDeviceId,
+        turnPurpose,
+        reason: eligibility.reason,
+      });
+      if (eligibility.reason === "DEVICE_NOT_REGISTERED") {
+        throw new HttpsError("not-found", "DEVICE_NOT_REGISTERED");
+      }
+      if (eligibility.reason === "AUTH_UID_MISMATCH") {
+        throw new HttpsError("permission-denied", "DEVICE_IDENTITY_MISMATCH");
+      }
+      throw new HttpsError("failed-precondition", eligibility.reason);
+    }
+    const role = eligibility.role;
+
+    // A CAMERA may only ever request a challenge about itself -- defense-in-depth on top of the
+    // cameraClaims cross-check below (which would already deny a mismatched camera identity via
+    // authUid uniqueness), making the invariant explicit rather than incidental.
+    if (role === "CAMERA" && deviceId !== cameraDeviceId) {
+      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
+        deviceId,
+        role,
+        purpose,
+        cameraDeviceId,
+        turnPurpose,
+        reason: "CAMERA_TARGET_MISMATCH",
+      });
+      throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+    }
+
+    // Same preliminary access checks getTurnCredentials itself already performs, reused directly
+    // rather than re-implemented -- see getVerifiedCameraClaim's own doc. getTurnCredentials will
+    // independently repeat its own checks immediately before actually vending credentials; this
+    // callable only ever issues a challenge, never TURN credentials.
+    const claim = await getVerifiedCameraClaim(db, cameraDeviceId, authUid);
+    if (claim.access === "not-found") {
+      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "CAMERA_NOT_FOUND" });
+      throw new HttpsError("not-found", "CAMERA_NOT_FOUND");
+    }
+    if (claim.access === "denied") {
+      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "PERMISSION_DENIED" });
+      throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+    }
+
+    // Device-status enforcement on the TARGET camera -- reused exactly as getTurnCredentials
+    // itself already applies it, unmodified. Throws its own already-safe HttpsError directly
+    // (and logs its own DEVICE_OPERATIONAL_CHECK_DENIED event) if the camera is suspended/revoked.
+    await assertRegisteredDeviceOperational(db, cameraDeviceId);
+
+    const entitlements = await getEffectiveUserEntitlements(authUid, db);
+    if (!entitlements.turnAccessAllowed) {
+      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "TURN_ACCESS_DENIED" });
+      throw new HttpsError("permission-denied", "TURN_ACCESS_DENIED");
+    }
+
+    const canonicalRequestPayload = buildCanonicalTurnCredentialsRequestPayload(turnRequestPayload);
+    const requestHash = sha256Hex(canonicalRequestPayload);
+    const nonce = generateChallengeNonce();
+    const expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + CHALLENGE_TTL_SECONDS * 1000);
+
+    const challengeRef = db.collection("deviceChallenges").doc();
+    const challengeId = challengeRef.id;
+    const devicePurpose: DeviceChallengePurpose = DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS;
+
+    const canonicalPayload = buildCanonicalDeviceProofPayload({
+      challengeId,
+      deviceId,
+      role,
+      purpose: devicePurpose,
+      authUid,
+      nonce,
+      requestHash,
+      expiresAtMillis: expiresAt.toMillis(),
+    });
+
+    try {
+      await challengeRef.set(
+        buildDeviceChallengeDocument({
+          challengeId,
+          deviceId,
+          role,
+          authUid,
+          purpose: devicePurpose,
+          nonce,
+          requestHash,
+          expiresAt,
+        })
+      );
+    } catch {
+      logger.error("DEVICE_CHALLENGE_CREATE_DENIED", {
+        deviceId,
+        role,
+        purpose,
+        cameraDeviceId,
+        turnPurpose,
+        reason: "CHALLENGE_WRITE_FAILED",
+      });
+      throw new HttpsError("internal", "CHALLENGE_CREATE_FAILED");
+    }
+
+    logger.info("DEVICE_CHALLENGE_CREATE_SUCCESS", { deviceId, role, purpose, cameraDeviceId, turnPurpose });
+
+    return {
+      challengeId,
+      nonce,
+      purpose: devicePurpose,
+      expiresAt: expiresAt.toMillis(),
+      canonicalPayload,
+    };
   }
 );
 
