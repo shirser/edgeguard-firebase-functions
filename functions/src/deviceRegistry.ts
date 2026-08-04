@@ -413,12 +413,63 @@ export function validateEcP256PublicKey(publicKeyBase64: string): PublicKeyValid
   return { valid: true, derBuffer, canonicalBase64: publicKeyBase64, fingerprint };
 }
 
+// --- HOME first-key freshness gate --------------------------------------------------------------
+// Protects the FIRST assignment of a HOME device's public key (missing document -> keystore, or
+// existing legacy+null -> keystore) with a requirement that the caller's Firebase session is
+// recent. An already-registered HOME device resubmitting its already-stored key (idempotent) never
+// goes through this gate -- see decidePublicKeyRegistration below, which only ever consults it on
+// the legacy->keystore first-write branch, never on the keystore/idempotent or keystore/conflict
+// branches. CAMERA never consults this at all -- applyCameraPublicKeyRegistration never populates
+// the `freshAuthCheck` parameter (see its own doc).
+
+// How old request.auth.token.auth_time (Unix seconds) may be, relative to the server's own clock,
+// for a first HOME key assignment to proceed.
+export const HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS = 300;
+
+// How far into the future auth_time may appear to still be accepted -- accounts for ordinary clock
+// skew between the token-issuing server and this function's own clock, never a reason to accept an
+// auth_time that is *older* than HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS.
+export const AUTH_TIME_FUTURE_SKEW_SECONDS = 30;
+
+// Every way an auth_time claim can fail the freshness check -- a fixed, stable enum, safe to log
+// (an "age category", never the actual auth_time or current timestamp).
+export type AuthTimeFreshnessReason = "MISSING" | "NOT_A_NUMBER" | "NOT_FINITE" | "TOO_FAR_IN_FUTURE" | "TOO_OLD";
+
+export type AuthTimeFreshnessResult = { fresh: true } | { fresh: false; reason: AuthTimeFreshnessReason };
+
+// Pure: validates a Firebase Auth `auth_time` claim (Unix seconds, as found on
+// request.auth.token.auth_time) against the current server time. `authTime` is deliberately typed
+// `unknown` -- this claim comes from a decoded ID token and this function must not assume it is
+// even a number before checking. `nowSeconds` is an explicit parameter, never computed via
+// Date.now() inside this function, so a test can pin the exact boundary instant instead of racing
+// the real clock (same pattern as entitlements.ts's isExpired(stored, nowMillis)) -- the one real
+// Date.now() read for this gate happens once, at the callable's own top level (index.ts).
+export function checkAuthTimeFreshness(authTime: unknown, nowSeconds: number): AuthTimeFreshnessResult {
+  if (authTime === undefined || authTime === null) {
+    return { fresh: false, reason: "MISSING" };
+  }
+  if (typeof authTime !== "number") {
+    return { fresh: false, reason: "NOT_A_NUMBER" };
+  }
+  if (!Number.isFinite(authTime)) {
+    return { fresh: false, reason: "NOT_FINITE" };
+  }
+  if (authTime > nowSeconds + AUTH_TIME_FUTURE_SKEW_SECONDS) {
+    return { fresh: false, reason: "TOO_FAR_IN_FUTURE" };
+  }
+  if (nowSeconds - authTime > HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS) {
+    return { fresh: false, reason: "TOO_OLD" };
+  }
+  return { fresh: true };
+}
+
 // Every outcome the registerDevicePublicKey transactions below can resolve to. Deliberately not
 // exceptions -- these are all *expected*, named business outcomes the caller (the
 // registerDevicePublicKey callable) maps onto specific client-facing HttpsErrors; only a genuine
 // Firestore/infrastructure failure is left to propagate as a real thrown error (see below).
-// "camera_not_claimed" is CAMERA-specific (see applyCameraPublicKeyRegistration); every other
-// outcome is shared between both roles.
+// "camera_not_claimed" is CAMERA-specific (see applyCameraPublicKeyRegistration); "recent_auth_required"
+// is HOME-first-key-specific (see the freshness gate above); every other outcome is shared between
+// both roles.
 export type PublicKeyRegistrationOutcome =
   | { outcome: "registered" }
   | { outcome: "idempotent" }
@@ -430,7 +481,8 @@ export type PublicKeyRegistrationOutcome =
   | { outcome: "owner_uid_mismatch" }
   | { outcome: "revoked" }
   | { outcome: "key_conflict" }
-  | { outcome: "corrupt" };
+  | { outcome: "corrupt" }
+  | { outcome: "recent_auth_required"; reason: AuthTimeFreshnessReason };
 
 // Same shape as PublicKeyRegistrationOutcome, but the two outcomes that require a write
 // (idempotent/registered) also carry the exact fields to write -- kept internal (not exported)
@@ -445,7 +497,8 @@ type PublicKeyRegistrationDecision =
   | { outcome: "owner_uid_mismatch" }
   | { outcome: "revoked" }
   | { outcome: "key_conflict" }
-  | { outcome: "corrupt" };
+  | { outcome: "corrupt" }
+  | { outcome: "recent_auth_required"; reason: AuthTimeFreshnessReason };
 
 // The single, shared decision core for legacy -> keystore registration -- used by BOTH
 // applyPublicKeyRegistration (HOME) and applyCameraPublicKeyRegistration (CAMERA) so neither
@@ -463,9 +516,22 @@ type PublicKeyRegistrationDecision =
 // ever re-verifies them against the stored document, it never derives them itself and never
 // trusts anything the client asserts about its own identity. `expectedOwnerUid: null` skips the
 // ownerUid check entirely (CAMERA's ownerUid is never used for authentication).
+//
+// `freshAuthCheck`, when present, is consulted ONLY on the legacy->keystore first-write branch at
+// the bottom of this function -- never on the keystore/idempotent or keystore/key_conflict
+// branches (an already-registered device resubmitting its own stored key, or a genuinely
+// different key, both resolve exactly as before, regardless of session age) -- see the freshness
+// gate's own doc above. `applyCameraPublicKeyRegistration` never populates this parameter, so
+// CAMERA's own legacy->keystore transition is completely unaffected by this gate.
 function decidePublicKeyRegistration(
   existing: RegisteredDevice | null,
-  params: { role: DeviceRole; expectedAuthUid: string; expectedOwnerUid: string | null; canonicalPublicKey: string }
+  params: {
+    role: DeviceRole;
+    expectedAuthUid: string;
+    expectedOwnerUid: string | null;
+    canonicalPublicKey: string;
+    freshAuthCheck?: { authTime: unknown; nowSeconds: number };
+  }
 ): PublicKeyRegistrationDecision {
   if (!existing) {
     return { outcome: "not_found" };
@@ -494,7 +560,10 @@ function decidePublicKeyRegistration(
 
   if (existing.identityMode === "keystore") {
     // existing.publicKey is guaranteed non-null here -- the corruption check above already ruled
-    // out identityMode:"keystore" with publicKey:null.
+    // out identityMode:"keystore" with publicKey:null. Neither branch below ever consults
+    // freshAuthCheck -- an idempotent resubmit of the already-stored key must keep working on an
+    // old session (see the freshness gate's own doc), and a conflicting key is rejected the same
+    // way regardless of session age.
     if (existing.publicKey === params.canonicalPublicKey) {
       return { outcome: "idempotent", writeFields: { lastSeenAt: admin.firestore.FieldValue.serverTimestamp() } };
     }
@@ -502,9 +571,19 @@ function decidePublicKeyRegistration(
   }
 
   // identityMode === "legacy" and publicKey === null (corruption already ruled out) -- the one and
-  // only first-registration path. Only identityMode/publicKey/updatedAt/lastSeenAt are ever
-  // written -- deviceId/role/authUid/ownerUid/status/suspensionReason/createdAt/revokedAt are
-  // never part of this write.
+  // only first-registration path for an EXISTING document. This is a first-key migration exactly
+  // like the missing-document HOME bootstrap in applyPublicKeyRegistration below, so it is gated
+  // by the same freshness requirement whenever the caller populated freshAuthCheck (HOME only).
+  if (params.freshAuthCheck) {
+    const freshness = checkAuthTimeFreshness(params.freshAuthCheck.authTime, params.freshAuthCheck.nowSeconds);
+    if (!freshness.fresh) {
+      return { outcome: "recent_auth_required", reason: freshness.reason };
+    }
+  }
+
+  // Only identityMode/publicKey/updatedAt/lastSeenAt are ever written -- deviceId/role/authUid/
+  // ownerUid/status/suspensionReason/createdAt/revokedAt are never part of this write (so an
+  // existing suspension, for example, survives this exact same as before).
   const now = admin.firestore.FieldValue.serverTimestamp();
   return {
     outcome: "registered",
@@ -515,8 +594,8 @@ function decidePublicKeyRegistration(
 // Applies a decidePublicKeyRegistration() result inside the caller's own transaction: performs
 // the merge-write for "registered"/"idempotent" (nothing else ever writes), logs the one warning
 // a "corrupt" outcome needs (deviceId/role only -- see docs/DEVICE_REGISTRY.md), and returns the
-// plain outcome (dropping `writeFields`, an internal-only detail) for the callable to map onto an
-// HttpsError.
+// plain outcome for the callable to map onto an HttpsError -- preserving `reason` for
+// "recent_auth_required", the one outcome that carries extra data beyond the discriminant itself.
 function finalizePublicKeyRegistrationDecision(
   t: admin.firestore.Transaction,
   ref: admin.firestore.DocumentReference,
@@ -528,6 +607,9 @@ function finalizePublicKeyRegistrationDecision(
   }
   if (decision.outcome === "registered" || decision.outcome === "idempotent") {
     t.set(ref, decision.writeFields, { merge: true });
+  }
+  if (decision.outcome === "recent_auth_required") {
+    return { outcome: "recent_auth_required", reason: decision.reason };
   }
   return { outcome: decision.outcome };
 }
@@ -561,6 +643,13 @@ export async function applyPublicKeyRegistration(
     expectedAuthUid: string;
     expectedOwnerUid: string | null;
     canonicalPublicKey: string;
+    // request.auth.token.auth_time (raw, unvalidated) and the current server time in Unix
+    // seconds -- see the freshness gate's own doc above. Required here (not optional) since this
+    // function is only ever invoked for HOME, where every first-key path (bootstrap below, or the
+    // legacy->keystore branch inside decidePublicKeyRegistration) needs it; an already-keystore
+    // device's idempotent/conflict paths simply never consult it.
+    authTime: unknown;
+    nowSeconds: number;
   }
 ): Promise<PublicKeyRegistrationOutcome> {
   const ref = registeredDeviceRef(db, params.deviceId);
@@ -572,6 +661,17 @@ export async function applyPublicKeyRegistration(
     if (!existing) {
       if (params.role !== "HOME") {
         return { outcome: "not_found" };
+      }
+
+      // First-key migration #1: missing document -> keystore. Requires a recent Firebase session
+      // -- see the freshness gate's own doc above -- checked here, inside this same transaction,
+      // strictly after the registry read above and strictly before the write below (see this
+      // module's "Important order" doc / docs/DEVICE_REGISTRY.md): the current registry state is
+      // what determines whether this is a first-key migration at all, so freshness is never
+      // required for a call this function doesn't even recognize as one.
+      const freshness = checkAuthTimeFreshness(params.authTime, params.nowSeconds);
+      if (!freshness.fresh) {
+        return { outcome: "recent_auth_required", reason: freshness.reason };
       }
 
       // Validation (deviceId/role/algorithm/Base64/SPKI DER/EC/P-256/canonical Base64) has
@@ -598,7 +698,14 @@ export async function applyPublicKeyRegistration(
       return { outcome: "home_created" };
     }
 
-    const decision = decidePublicKeyRegistration(existing, params);
+    // First-key migration #2: existing legacy+null -> keystore, gated the same way inside
+    // decidePublicKeyRegistration itself (only on that specific branch -- never on idempotent/
+    // conflict). role is always "HOME" here (this function is HOME-only, per its own doc), so
+    // this always populates freshAuthCheck; still spelled out explicitly rather than assumed.
+    const decision = decidePublicKeyRegistration(existing, {
+      ...params,
+      freshAuthCheck: params.role === "HOME" ? { authTime: params.authTime, nowSeconds: params.nowSeconds } : undefined,
+    });
     return finalizePublicKeyRegistrationDecision(t, ref, { deviceId: params.deviceId, role: params.role }, decision);
   });
 }

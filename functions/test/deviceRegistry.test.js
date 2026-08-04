@@ -28,6 +28,9 @@ const {
   checkRegisteredDeviceOperational,
   planDeviceLimitDecision,
   reconcileUserDeviceLimits,
+  checkAuthTimeFreshness,
+  HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS,
+  AUTH_TIME_FUTURE_SKEW_SECONDS,
 } = require("../lib/index.js");
 const admin = require("firebase-admin");
 
@@ -37,10 +40,15 @@ function registryRef(deviceId) {
   return db.collection("registeredDevices").doc(deviceId);
 }
 
-function fakeRequest(data, uid) {
+// authOverrides is merged onto `token` -- defaults to a fresh auth_time (right now) so every
+// EXISTING call site (2-arg fakeRequest(data, uid)) keeps satisfying the HOME first-key freshness
+// gate without needing to know anything about it. Tests that care about auth_time pass
+// `{ auth_time: <value> }` (or `{ auth_time: undefined }` for "claim missing entirely") as a third
+// argument.
+function fakeRequest(data, uid, authOverrides = {}) {
   return {
     data,
-    auth: uid ? { uid, token: {}, rawToken: "" } : undefined,
+    auth: uid ? { uid, token: { auth_time: Math.floor(Date.now() / 1000), ...authOverrides }, rawToken: "" } : undefined,
     rawRequest: {},
     acceptsStreaming: false,
   };
@@ -874,6 +882,391 @@ test("registerDevicePublicKey: 13/1-7. HOME without a registry document creates 
   assert.ok(data.updatedAt instanceof admin.firestore.Timestamp, "6. updatedAt must be a Timestamp");
   assert.ok(data.lastSeenAt instanceof admin.firestore.Timestamp, "6. lastSeenAt must be a Timestamp");
   assert.equal(data.revokedAt, null, "7. revokedAt must be null");
+});
+
+// =================================================================================================
+// HOME first-key freshness gate -- request.auth.token.auth_time must be recent for the FIRST
+// public-key assignment only (missing document -> keystore, or existing legacy+null -> keystore).
+// An already-keystore device (idempotent same-key, or a conflicting different key) never consults
+// this. CAMERA never consults this at all.
+// =================================================================================================
+
+test("registerDevicePublicKey: freshness/1. missing HOME registry + auth_time under 300s creates the keystore document", async () => {
+  const publicKey = generateP256PublicKeyBase64();
+  const authTime = Math.floor(Date.now() / 1000) - 100;
+
+  const response = await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID, { auth_time: authTime })
+  );
+
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).data().publicKey, publicKey);
+});
+
+test("registerDevicePublicKey: freshness/2. missing HOME registry + auth_time exactly 300s old is allowed", async () => {
+  const publicKey = generateP256PublicKeyBase64();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const authTime = nowSeconds - HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS;
+
+  const response = await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID, { auth_time: authTime })
+  );
+
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+});
+
+test("registerDevicePublicKey: freshness/3. missing HOME registry + auth_time older than 300s is rejected", async () => {
+  const authTime = Math.floor(Date.now() / 1000) - (HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS + 1);
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID,
+        { auth_time: authTime }
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "RECENT_AUTH_REQUIRED"
+  );
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).exists, false, "no document must be created on rejection");
+});
+
+test("registerDevicePublicKey: freshness/4. missing HOME registry + missing auth_time is rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID,
+        { auth_time: undefined }
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "RECENT_AUTH_REQUIRED"
+  );
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).exists, false);
+});
+
+test("registerDevicePublicKey: freshness/5. missing HOME registry + a string auth_time is rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID,
+        { auth_time: "not-a-number" }
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "RECENT_AUTH_REQUIRED"
+  );
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).exists, false);
+});
+
+test("registerDevicePublicKey: freshness/6. missing HOME registry + NaN auth_time is rejected", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID,
+        { auth_time: NaN }
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "RECENT_AUTH_REQUIRED"
+  );
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).exists, false);
+});
+
+test("registerDevicePublicKey: freshness/7. auth_time too far in the future is rejected", async () => {
+  const authTime = Math.floor(Date.now() / 1000) + AUTH_TIME_FUTURE_SKEW_SECONDS + 60;
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID,
+        { auth_time: authTime }
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "RECENT_AUTH_REQUIRED"
+  );
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).exists, false);
+});
+
+test("registerDevicePublicKey: freshness/8. auth_time within the allowed clock-skew is accepted", async () => {
+  const publicKey = generateP256PublicKeyBase64();
+  const authTime = Math.floor(Date.now() / 1000) + AUTH_TIME_FUTURE_SKEW_SECONDS;
+
+  const response = await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID, { auth_time: authTime })
+  );
+
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+});
+
+test("registerDevicePublicKey: freshness/9. an existing legacy HOME document (null publicKey) requires fresh auth to migrate to keystore", async () => {
+  await seedKeyTestDevice(KEY_TEST_HOME_ID, {
+    role: "HOME",
+    authUid: KEY_TEST_OWNER_UID,
+    ownerUid: KEY_TEST_OWNER_UID,
+    identityMode: "legacy",
+    publicKey: null,
+  });
+  const staleAuthTime = Math.floor(Date.now() / 1000) - (HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS + 1);
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID,
+        { auth_time: staleAuthTime }
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "RECENT_AUTH_REQUIRED"
+  );
+
+  const data = (await registryRef(KEY_TEST_HOME_ID).get()).data();
+  assert.equal(data.identityMode, "legacy", "the document must remain untouched on rejection");
+  assert.equal(data.publicKey, null);
+});
+
+test("registerDevicePublicKey: freshness/10. an existing keystore HOME device resubmitting the SAME key stays idempotent on an old session", async () => {
+  const publicKey = generateP256PublicKeyBase64();
+  await seedKeyTestDevice(KEY_TEST_HOME_ID, {
+    role: "HOME",
+    authUid: KEY_TEST_OWNER_UID,
+    ownerUid: KEY_TEST_OWNER_UID,
+    identityMode: "keystore",
+    publicKey,
+  });
+  const staleAuthTime = Math.floor(Date.now() / 1000) - (HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS + 1000);
+
+  const response = await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID, { auth_time: staleAuthTime })
+  );
+
+  assert.deepEqual(response, { success: true, identityMode: "keystore" }, "idempotent success must work on an old session");
+});
+
+test("registerDevicePublicKey: freshness/11. an existing keystore HOME device submitting a DIFFERENT key is still rejected as a conflict, unaffected by auth_time", async () => {
+  const storedKey = generateP256PublicKeyBase64();
+  const differentKey = generateP256PublicKeyBase64();
+  await seedKeyTestDevice(KEY_TEST_HOME_ID, {
+    role: "HOME",
+    authUid: KEY_TEST_OWNER_UID,
+    ownerUid: KEY_TEST_OWNER_UID,
+    identityMode: "keystore",
+    publicKey: storedKey,
+  });
+  // Fresh auth_time here on purpose -- proves the rejection is a genuine key conflict, not
+  // secretly a freshness rejection in disguise.
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: differentKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "PUBLIC_KEY_ALREADY_REGISTERED"
+  );
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).data().publicKey, storedKey);
+});
+
+test("registerDevicePublicKey: freshness/12. a suspended HOME device at first-key migration also requires fresh auth, and keeps its suspension once migrated", async () => {
+  await seedKeyTestDevice(KEY_TEST_HOME_ID, {
+    role: "HOME",
+    authUid: KEY_TEST_OWNER_UID,
+    ownerUid: KEY_TEST_OWNER_UID,
+    identityMode: "legacy",
+    publicKey: null,
+    status: "suspended",
+    suspensionReason: "plan",
+  });
+  const staleAuthTime = Math.floor(Date.now() / 1000) - (HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS + 1);
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID,
+        { auth_time: staleAuthTime }
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "RECENT_AUTH_REQUIRED"
+  );
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).data().status, "suspended", "rejection must not touch status");
+
+  const publicKey = generateP256PublicKeyBase64();
+  const response = await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+  );
+
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+  const data = (await registryRef(KEY_TEST_HOME_ID).get()).data();
+  assert.equal(data.status, "suspended", "migrating the key must not lift the suspension");
+  assert.equal(data.suspensionReason, "plan");
+  assert.equal(data.identityMode, "keystore");
+  assert.equal(data.publicKey, publicKey);
+});
+
+test("registerDevicePublicKey: freshness/13. a revoked HOME device is rejected as revoked, not as a recent-auth error", async () => {
+  await seedKeyTestDevice(KEY_TEST_HOME_ID, {
+    role: "HOME",
+    authUid: KEY_TEST_OWNER_UID,
+    ownerUid: KEY_TEST_OWNER_UID,
+    identityMode: "legacy",
+    publicKey: null,
+    status: "revoked",
+    revokedAt: admin.firestore.Timestamp.now(),
+  });
+  const staleAuthTime = Math.floor(Date.now() / 1000) - (HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS + 1);
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID,
+        { auth_time: staleAuthTime }
+      )
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "DEVICE_REVOKED"
+  );
+});
+
+test("registerDevicePublicKey: freshness/14. CAMERA behavior is unaffected -- missing registry rejected and a valid claimed registration succeeds regardless of auth_time", async () => {
+  const staleAuthTime = Math.floor(Date.now() / 1000) - (HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS + 100000);
+
+  // cameraClaims must exist and match BEFORE the missing-registry check even runs --
+  // applyCameraPublicKeyRegistration reads cameraClaims first; without it, the callable rejects
+  // with CAMERA_NOT_CLAIMED before ever reaching the registeredDevices read this assertion is
+  // actually about. Same setup as the passing "missing registry document rejected (CAMERA,
+  // cameraClaims present)" test above.
+  await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
+
+  // Missing registry -> still DEVICE_NOT_REGISTERED, never RECENT_AUTH_REQUIRED.
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_CAMERA_AUTH_UID,
+        { auth_time: undefined }
+      )
+    ),
+    (err) => err.code === "not-found" && err.message === "DEVICE_NOT_REGISTERED"
+  );
+
+  // A properly claimed, registered (legacy) Camera still succeeds with a stale/absent auth_time --
+  // the freshness gate never applies to CAMERA at all.
+  await seedKeyTestDevice(KEY_TEST_CAMERA_ID);
+  const publicKey = generateP256PublicKeyBase64();
+  const response = await registerDevicePublicKey.run(
+    fakeRequest(
+      { deviceId: KEY_TEST_CAMERA_ID, role: "CAMERA", publicKey, algorithm: "ES256" },
+      KEY_TEST_CAMERA_AUTH_UID,
+      { auth_time: staleAuthTime }
+    )
+  );
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+  assert.equal((await registryRef(KEY_TEST_CAMERA_ID).get()).data().publicKey, publicKey, "the submitted key must be the one stored");
+});
+
+test("registerDevicePublicKey: freshness/15. a rejection log never contains the uid, the exact auth_time, or the public key", async () => {
+  const publicKey = generateP256PublicKeyBase64();
+  const staleAuthTime = Math.floor(Date.now() / 1000) - (HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS + 1);
+
+  const output = await captureStdio(async () => {
+    await assert.rejects(
+      registerDevicePublicKey.run(
+        fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID, {
+          auth_time: staleAuthTime,
+        })
+      )
+    );
+  });
+
+  assert.ok(output.includes("RECENT_AUTH_REQUIRED"));
+  assert.ok(output.includes("TOO_OLD"), "the safe age category is allowed");
+  assert.ok(!output.includes(String(staleAuthTime)), "the exact auth_time must never be logged");
+  assert.ok(!output.includes(KEY_TEST_OWNER_UID), "the uid must never be logged");
+  assert.ok(!output.includes(publicKey), "the raw public key must never be logged");
+});
+
+test("registerDevicePublicKey: freshness/16. two concurrent first-key HOME requests -- a stale one can never win the write, regardless of race timing", async () => {
+  const freshKey = generateP256PublicKeyBase64();
+  const staleKey = generateP256PublicKeyBase64();
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const freshAuthTime = nowSeconds;
+  const staleAuthTime = nowSeconds - (HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS + 1);
+
+  const results = await Promise.allSettled([
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: freshKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID, {
+        auth_time: freshAuthTime,
+      })
+    ),
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: staleKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID, {
+        auth_time: staleAuthTime,
+      })
+    ),
+  ]);
+
+  const listed = await db.collection("registeredDevices").where("deviceId", "==", KEY_TEST_HOME_ID).get();
+  assert.equal(listed.size, 1, "exactly one document is ever created, regardless of race timing");
+  assert.equal(listed.docs[0].data().publicKey, freshKey, "only the fresh request's key can ever be the one stored");
+
+  const staleResult = results[1];
+  if (staleResult.status === "fulfilled") {
+    assert.fail("the stale request must never succeed with its own different key");
+  } else {
+    assert.ok(
+      staleResult.reason.message === "RECENT_AUTH_REQUIRED" || staleResult.reason.message === "PUBLIC_KEY_ALREADY_REGISTERED",
+      `unexpected rejection message: ${staleResult.reason.message}`
+    );
+  }
+});
+
+// --- checkAuthTimeFreshness: pure function ------------------------------------------------------
+
+test("checkAuthTimeFreshness: fresh (well within the window) is accepted", () => {
+  const now = 1_700_000_000;
+  assert.deepEqual(checkAuthTimeFreshness(now - 10, now), { fresh: true });
+});
+
+test("checkAuthTimeFreshness: exactly at the 300s boundary is accepted", () => {
+  const now = 1_700_000_000;
+  assert.deepEqual(checkAuthTimeFreshness(now - HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS, now), { fresh: true });
+});
+
+test("checkAuthTimeFreshness: one second past the 300s boundary is rejected as TOO_OLD", () => {
+  const now = 1_700_000_000;
+  assert.deepEqual(checkAuthTimeFreshness(now - HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS - 1, now), {
+    fresh: false,
+    reason: "TOO_OLD",
+  });
+});
+
+test("checkAuthTimeFreshness: missing/null is rejected as MISSING", () => {
+  const now = 1_700_000_000;
+  assert.deepEqual(checkAuthTimeFreshness(undefined, now), { fresh: false, reason: "MISSING" });
+  assert.deepEqual(checkAuthTimeFreshness(null, now), { fresh: false, reason: "MISSING" });
+});
+
+test("checkAuthTimeFreshness: a non-number is rejected as NOT_A_NUMBER", () => {
+  const now = 1_700_000_000;
+  assert.deepEqual(checkAuthTimeFreshness("1700000000", now), { fresh: false, reason: "NOT_A_NUMBER" });
+});
+
+test("checkAuthTimeFreshness: NaN/Infinity are rejected as NOT_FINITE", () => {
+  const now = 1_700_000_000;
+  assert.deepEqual(checkAuthTimeFreshness(NaN, now), { fresh: false, reason: "NOT_FINITE" });
+  assert.deepEqual(checkAuthTimeFreshness(Infinity, now), { fresh: false, reason: "NOT_FINITE" });
+});
+
+test("checkAuthTimeFreshness: exactly at the future-skew boundary is accepted", () => {
+  const now = 1_700_000_000;
+  assert.deepEqual(checkAuthTimeFreshness(now + AUTH_TIME_FUTURE_SKEW_SECONDS, now), { fresh: true });
+});
+
+test("checkAuthTimeFreshness: one second past the future-skew boundary is rejected as TOO_FAR_IN_FUTURE", () => {
+  const now = 1_700_000_000;
+  assert.deepEqual(checkAuthTimeFreshness(now + AUTH_TIME_FUTURE_SKEW_SECONDS + 1, now), {
+    fresh: false,
+    reason: "TOO_FAR_IN_FUTURE",
+  });
 });
 
 // 10. CAMERA's own missing-registry-document behavior is completely unaffected by the HOME

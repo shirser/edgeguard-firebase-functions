@@ -57,6 +57,9 @@ export {
   checkRegisteredDeviceOperational,
   planDeviceLimitDecision,
   reconcileUserDeviceLimits,
+  checkAuthTimeFreshness,
+  HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS,
+  AUTH_TIME_FUTURE_SKEW_SECONDS,
 } from "./deviceRegistry";
 export type {
   DeviceRole,
@@ -72,6 +75,8 @@ export type {
   DeviceOperationalReason,
   DeviceOperationalDecision,
   DeviceLimitReconciliation,
+  AuthTimeFreshnessReason,
+  AuthTimeFreshnessResult,
 } from "./deviceRegistry";
 
 function hashSecret(secret: string): string {
@@ -1315,6 +1320,17 @@ export const registerDevicePublicKey = onCall(
     // so a concurrent unpair (which deletes cameraClaims) can never race between "verified" and
     // "registered" -- see deviceRegistry.ts's own doc for why an out-of-transaction pre-check was
     // not safe here.
+    // request.auth.token.auth_time is the server-verified Firebase Auth claim for "when this
+    // session's credential was actually presented" (Unix seconds) -- the ONLY source
+    // HOME_KEY_REGISTRATION_MAX_AUTH_AGE_SECONDS is ever checked against below. Read here, raw and
+    // unvalidated (deviceRegistry.ts's checkAuthTimeFreshness is what actually validates it) --
+    // never taken from request.data, which has no auth_time field at all. nowSeconds is the one
+    // real Date.now() read for this whole gate, taken once at this boundary so every layer beneath
+    // it (applyPublicKeyRegistration, decidePublicKeyRegistration, checkAuthTimeFreshness) is
+    // driven by a plain parameter, not a hidden clock read.
+    const authTime = (request.auth.token as Record<string, unknown>)?.auth_time;
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
     let result: PublicKeyRegistrationOutcome;
     try {
       result =
@@ -1330,6 +1346,8 @@ export const registerDevicePublicKey = onCall(
               expectedAuthUid: callerUid,
               expectedOwnerUid: callerUid,
               canonicalPublicKey: keyValidation.canonicalBase64,
+              authTime,
+              nowSeconds,
             });
     } catch (error: any) {
       logger.error("REGISTER_DEVICE_PUBLIC_KEY_FAILED", {
@@ -1401,6 +1419,18 @@ export const registerDevicePublicKey = onCall(
           publicKeyFingerprint: keyValidation.fingerprint,
         });
         return { success: true, identityMode: "keystore" as const };
+      case "recent_auth_required":
+        // Safe to log: a fixed reason, a fixed auth-age *category* (never the actual auth_time or
+        // current timestamp), deviceId, role, algorithm. Never the uid, the ID token, or the
+        // public key.
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_DENIED", {
+          deviceId,
+          role,
+          algorithm,
+          reason: "RECENT_AUTH_REQUIRED",
+          authTimeCategory: result.reason,
+        });
+        throw new HttpsError("failed-precondition", "RECENT_AUTH_REQUIRED");
       default:
         throw new HttpsError("internal", "INTERNAL");
     }
