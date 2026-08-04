@@ -1393,6 +1393,14 @@ export const registerDevicePublicKey = onCall(
           publicKeyFingerprint: keyValidation.fingerprint,
         });
         return { success: true, identityMode: "keystore" as const };
+      case "home_created":
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_HOME_CREATED", {
+          deviceId,
+          role,
+          algorithm,
+          publicKeyFingerprint: keyValidation.fingerprint,
+        });
+        return { success: true, identityMode: "keystore" as const };
       default:
         throw new HttpsError("internal", "INTERNAL");
     }

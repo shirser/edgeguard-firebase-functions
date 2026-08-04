@@ -422,6 +422,7 @@ export function validateEcP256PublicKey(publicKeyBase64: string): PublicKeyValid
 export type PublicKeyRegistrationOutcome =
   | { outcome: "registered" }
   | { outcome: "idempotent" }
+  | { outcome: "home_created" }
   | { outcome: "not_found" }
   | { outcome: "camera_not_claimed" }
   | { outcome: "role_mismatch" }
@@ -537,14 +538,21 @@ function finalizePublicKeyRegistrationDecision(
 // real rejected promise, and it is the caller's job (the callable) to turn that into a controlled
 // internal/INTERNAL response rather than silently reporting success.
 //
-// Never creates registeredDevices/{deviceId} -- registering a device and registering its
-// cryptographic identity are different operations (see docs/DEVICE_REGISTRY.md); a missing
-// document is reported back as { outcome: "not_found" }, never created here.
-//
-// CAMERA registration does NOT use this function -- see applyCameraPublicKeyRegistration, which
-// additionally verifies cameraClaims inside the same transaction as the registry read/write
-// (verifying it outside, beforehand, would leave a window where an unpair between the check and
-// the write could remove cameraClaims while the key registration still went through).
+// HOME bootstrap: unlike CAMERA (always registered "legacy" first, by registerLegacyCamera during
+// createCameraPairingSession, long before any key is ever submitted), a HOME installation has no
+// earlier lazy-registration step -- registerLegacyHome only runs inside claimCameraForUser, which
+// requires a Camera to already be paired. A HOME device that calls registerDevicePublicKey before
+// ever pairing a camera would otherwise always hit a missing registeredDevices/{deviceId} document.
+// So, for role "HOME" only, a missing document is created directly here -- inside this same
+// transaction, atomically with the decision to do so -- as a complete, already-`"keystore"`
+// document, never a "legacy" intermediate. `role !== "HOME"` still returns `{ outcome: "not_found"
+// }` unconditionally (this function is only ever invoked for HOME from the real callable --
+// see index.ts -- but this guard keeps that guarantee explicit here too, not just implied by the
+// caller). CAMERA's own missing-document behavior is entirely unaffected: it never reaches this
+// function at all -- see applyCameraPublicKeyRegistration below, which additionally verifies
+// cameraClaims inside the same transaction as the registry read/write (verifying it outside,
+// beforehand, would leave a window where an unpair between the check and the write could remove
+// cameraClaims while the key registration still went through).
 export async function applyPublicKeyRegistration(
   db: admin.firestore.Firestore,
   params: {
@@ -560,6 +568,36 @@ export async function applyPublicKeyRegistration(
   return db.runTransaction(async (t): Promise<PublicKeyRegistrationOutcome> => {
     const snap = await t.get(ref);
     const existing = snap.exists ? (snap.data() as RegisteredDevice) : null;
+
+    if (!existing) {
+      if (params.role !== "HOME") {
+        return { outcome: "not_found" };
+      }
+
+      // Validation (deviceId/role/algorithm/Base64/SPKI DER/EC/P-256/canonical Base64) has
+      // already happened in the callable before this transaction ever starts -- an invalid key
+      // never reaches here, so a document is never created for one. The uid never comes from
+      // request body: expectedAuthUid/expectedOwnerUid are both request.auth.uid as already
+      // established by the callable, never anything the client asserts about its own identity.
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      t.set(ref, {
+        schemaVersion: DEVICE_REGISTRY_SCHEMA_VERSION,
+        deviceId: params.deviceId,
+        role: params.role,
+        authUid: params.expectedAuthUid,
+        ownerUid: params.expectedOwnerUid,
+        status: "active",
+        suspensionReason: null,
+        identityMode: "keystore",
+        publicKey: params.canonicalPublicKey,
+        createdAt: now,
+        updatedAt: now,
+        lastSeenAt: now,
+        revokedAt: null,
+      });
+      return { outcome: "home_created" };
+    }
+
     const decision = decidePublicKeyRegistration(existing, params);
     return finalizePublicKeyRegistrationDecision(t, ref, { deviceId: params.deviceId, role: params.role }, decision);
   });

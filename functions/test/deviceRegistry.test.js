@@ -845,18 +845,40 @@ test("registerDevicePublicKey: 12. valid P-256 SPKI is accepted", async () => {
   assert.deepEqual(response, { success: true, identityMode: "keystore" });
 });
 
-test("registerDevicePublicKey: 13. missing registry document rejected (HOME)", async () => {
-  await assert.rejects(
-    registerDevicePublicKey.run(
-      fakeRequest(
-        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
-        KEY_TEST_OWNER_UID
-      )
-    ),
-    (err) => err.code === "not-found" && err.message === "DEVICE_NOT_REGISTERED"
+// HOME bootstrap: unlike CAMERA (see the test right below this one, kept unchanged), a missing
+// registeredDevices/{deviceId} document for role HOME is no longer rejected -- registerDevicePublicKey
+// creates the full keystore-identity document directly, atomically, inside the same transaction as
+// the decision to do so. See applyPublicKeyRegistration in deviceRegistry.ts.
+test("registerDevicePublicKey: 13/1-7. HOME without a registry document creates one directly in keystore mode", async () => {
+  const publicKey = generateP256PublicKeyBase64();
+
+  const response = await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
   );
+
+  // Callable request/response contract is unchanged -- identical shape to every other successful
+  // registration.
+  assert.deepEqual(response, { success: true, identityMode: "keystore" });
+
+  const data = (await registryRef(KEY_TEST_HOME_ID).get()).data();
+  assert.equal(data.schemaVersion, 1);
+  assert.equal(data.deviceId, KEY_TEST_HOME_ID);
+  assert.equal(data.role, "HOME", "4. role must be HOME");
+  assert.equal(data.authUid, KEY_TEST_OWNER_UID, "2. authUid must equal the authenticated uid");
+  assert.equal(data.ownerUid, KEY_TEST_OWNER_UID, "3. ownerUid must equal the authenticated uid, never taken from the request body");
+  assert.equal(data.status, "active", "4. status must be active");
+  assert.equal(data.suspensionReason, null, "4. suspensionReason must be null");
+  assert.equal(data.identityMode, "keystore", "5. identityMode must be keystore -- no legacy intermediate");
+  assert.equal(data.publicKey, publicKey, "5. publicKey must be the canonical Base64 submitted");
+  assert.ok(data.createdAt instanceof admin.firestore.Timestamp, "6. createdAt must be a Timestamp");
+  assert.ok(data.updatedAt instanceof admin.firestore.Timestamp, "6. updatedAt must be a Timestamp");
+  assert.ok(data.lastSeenAt instanceof admin.firestore.Timestamp, "6. lastSeenAt must be a Timestamp");
+  assert.equal(data.revokedAt, null, "7. revokedAt must be null");
 });
 
+// 10. CAMERA's own missing-registry-document behavior is completely unaffected by the HOME
+// bootstrap change above -- kept exactly as it was (this test is not new, and must not be
+// deleted/weakened).
 test("registerDevicePublicKey: missing registry document rejected (CAMERA, cameraClaims present)", async () => {
   await keyTestClaimRef().set({ uid: KEY_TEST_OWNER_UID, cameraAuthUid: KEY_TEST_CAMERA_AUTH_UID });
   await assert.rejects(
@@ -868,6 +890,124 @@ test("registerDevicePublicKey: missing registry document rejected (CAMERA, camer
     ),
     (err) => err.code === "not-found" && err.message === "DEVICE_NOT_REGISTERED"
   );
+});
+
+// --- 8/9. HOME bootstrap validation: an invalid key or an unauthenticated caller must never
+// create a document ---------------------------------------------------------------------------
+
+test("registerDevicePublicKey: 8. HOME bootstrap -- a malformed public key does not create a registry document", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateRsaPublicKeyBase64(), algorithm: "ES256" },
+        KEY_TEST_OWNER_UID
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_PUBLIC_KEY"
+  );
+
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).exists, false);
+});
+
+test("registerDevicePublicKey: 9. HOME bootstrap -- an unauthenticated request does not create a registry document", async () => {
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest(
+        { deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: generateP256PublicKeyBase64(), algorithm: "ES256" },
+        undefined
+      )
+    ),
+    (err) => err.code === "unauthenticated"
+  );
+
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).exists, false);
+});
+
+// --- 11/12. HOME bootstrap first-write-wins: same key idempotent, different key rejected ---------
+
+test("registerDevicePublicKey: 11. HOME bootstrap -- a repeated call with the same key is idempotent", async () => {
+  const publicKey = generateP256PublicKeyBase64();
+
+  const first = await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+  );
+  const second = await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+  );
+
+  assert.deepEqual(first, { success: true, identityMode: "keystore" });
+  assert.deepEqual(second, { success: true, identityMode: "keystore" });
+
+  const listed = await db.collection("registeredDevices").where("deviceId", "==", KEY_TEST_HOME_ID).get();
+  assert.equal(listed.size, 1, "exactly one registeredDevices document");
+  assert.equal(listed.docs[0].data().publicKey, publicKey);
+});
+
+test("registerDevicePublicKey: 12. HOME bootstrap -- a later call with a different key is rejected and never replaces the stored key", async () => {
+  const firstKey = generateP256PublicKeyBase64();
+  const secondKey = generateP256PublicKeyBase64();
+
+  await registerDevicePublicKey.run(
+    fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: firstKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+  );
+
+  await assert.rejects(
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: secondKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "PUBLIC_KEY_ALREADY_REGISTERED"
+  );
+
+  assert.equal((await registryRef(KEY_TEST_HOME_ID).get()).data().publicKey, firstKey);
+});
+
+// --- 13/14. concurrency: no out-of-transaction pre-check, Firestore's own contention/retry is
+// what resolves both races -------------------------------------------------------------------
+
+test("registerDevicePublicKey: 13. HOME bootstrap -- two concurrent same-key requests leave exactly one document with that key", async () => {
+  const publicKey = generateP256PublicKeyBase64();
+  const makeRequest = () =>
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+    );
+
+  const [first, second] = await Promise.all([makeRequest(), makeRequest()]);
+
+  // Both may succeed (one "home_created", one idempotent-on-retry) -- Firestore's own transaction
+  // contention/retry guarantees only one of them actually creates the document; the other's
+  // transaction is retried, sees the document the first one already committed, and resolves
+  // idempotently against it.
+  assert.deepEqual(first, { success: true, identityMode: "keystore" });
+  assert.deepEqual(second, { success: true, identityMode: "keystore" });
+
+  const listed = await db.collection("registeredDevices").where("deviceId", "==", KEY_TEST_HOME_ID).get();
+  assert.equal(listed.size, 1, "exactly one registeredDevices document, not two");
+  assert.equal(listed.docs[0].data().publicKey, publicKey);
+});
+
+test("registerDevicePublicKey: 14. HOME bootstrap -- two concurrent different-key requests leave only one first-write-wins key", async () => {
+  const keyA = generateP256PublicKeyBase64();
+  const keyB = generateP256PublicKeyBase64();
+
+  const results = await Promise.allSettled([
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: keyA, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+    ),
+    registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey: keyB, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+    ),
+  ]);
+
+  const fulfilled = results.filter((r) => r.status === "fulfilled");
+  const rejected = results.filter((r) => r.status === "rejected");
+
+  assert.equal(fulfilled.length, 1, "exactly one request must succeed");
+  assert.equal(rejected.length, 1, "the other must be rejected, never silently overwritten");
+  assert.equal(rejected[0].reason.message, "PUBLIC_KEY_ALREADY_REGISTERED");
+
+  const listed = await db.collection("registeredDevices").where("deviceId", "==", KEY_TEST_HOME_ID).get();
+  assert.equal(listed.size, 1, "exactly one document, exactly one stored key -- never both");
+  assert.ok(listed.docs[0].data().publicKey === keyA || listed.docs[0].data().publicKey === keyB);
 });
 
 test("registerDevicePublicKey: 14. HOME with matching authUid/ownerUid succeeds", async () => {
@@ -1391,6 +1531,20 @@ test("registerDevicePublicKey: an invalid-key rejection log never contains the r
   assert.ok(output.includes("REGISTER_DEVICE_PUBLIC_KEY_INVALID"));
   assert.ok(!output.includes(notDer), "the raw (invalid) key must not be logged even on rejection");
   assert.ok(!output.includes(KEY_TEST_CAMERA_AUTH_UID));
+});
+
+test("registerDevicePublicKey: 15. HOME bootstrap logs never contain the raw publicKey or the caller's uid", async () => {
+  const publicKey = generateP256PublicKeyBase64();
+
+  const output = await captureStdio(async () => {
+    await registerDevicePublicKey.run(
+      fakeRequest({ deviceId: KEY_TEST_HOME_ID, role: "HOME", publicKey, algorithm: "ES256" }, KEY_TEST_OWNER_UID)
+    );
+  });
+
+  assert.ok(output.includes("REGISTER_DEVICE_PUBLIC_KEY_HOME_CREATED"), "the new bootstrap-specific event should fire");
+  assert.ok(!output.includes(publicKey), "raw publicKey must never be logged");
+  assert.ok(!output.includes(KEY_TEST_OWNER_UID), "the caller's request.auth.uid (== authUid == ownerUid here) must never be logged");
 });
 
 // --- 36: a genuine Firestore failure is never swallowed as success -------------------------------
