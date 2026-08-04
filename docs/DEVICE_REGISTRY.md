@@ -1,24 +1,31 @@
-# Device Registry — Stage 1 + Android Keystore identity (stage 2)
+# Device Registry — Stage 1 + Android Keystore identity (stage 2) + status enforcement (stage 3)
 
 A single global, Admin-SDK-only Firestore collection that records every known Camera/Home
 installation ("device"), independently of `cameraClaims`/`pairingState`. Implemented in
 `functions/src/deviceRegistry.ts`.
 
-**Stage 1** (unchanged by this document's stage-2 addition) only creates and maintains the
-registry with `identityMode: "legacy"`. **Stage 2** (this addition) lets a device upgrade itself
-from `"legacy"` to `"keystore"` by registering a real Android Keystore-backed public key, via the
-`registerDevicePublicKey` callable. Neither stage is yet consulted anywhere to:
+**Stage 1** only creates and maintains the registry with `identityMode: "legacy"`. **Stage 2** lets
+a device upgrade itself from `"legacy"` to `"keystore"` by registering a real Android
+Keystore-backed public key, via the `registerDevicePublicKey` callable. **Stage 3** (this addition)
+makes `status` a real, enforced, three-way state (`active`/`suspended`/`revoked`) — explicit
+owner-triggered revocation (`revokeRegisteredDevice`), automatic plan-based suspension
+(`reconcileUserDeviceLimits`, triggered by `reconcileDevicesOnEntitlementChange`), and centralized
+operational enforcement (`checkRegisteredDeviceOperational`) wired into every server operation
+that requires a working device. None of the three stages:
 
-- limit device counts;
-- deny Live View;
 - **verify a signature over any request** (registering a key is not the same as proving
   possession of it on every subsequent call — see "What is enforced today, and what isn't" below);
 - replace `cameraClaims` (still the ownership source of truth);
-- replace `pairingState` (still the pairing-lifecycle source of truth).
+- replace `pairingState` (still the pairing-lifecycle source of truth);
+- cryptographically verify *which* Home installation is calling — see "Camera vs. Home status
+  enforcement" below, a real, currently-open gap.
 
-Existing pairing, unpair, notifications, TURN, and Live View behavior is unchanged. See
-[`docs/USER_ENTITLEMENTS.md`](USER_ENTITLEMENTS.md) for the separate, also-not-yet-fully-enforced
-plan/limits model — the two are unrelated and this stage does not connect them.
+Existing pairing, unpair, notifications, TURN, and Live View *behavior* (the WebRTC/signaling
+mechanics themselves) is unchanged; this stage only adds a new way for an operation to be denied
+before it would otherwise have proceeded. See [`docs/USER_ENTITLEMENTS.md`](USER_ENTITLEMENTS.md)
+for the separate plan/limits model this stage's plan-based suspension reads from (via
+`getPlanDeviceLimits`/`planDeviceLimitsFromEntitlementsData`), never from
+`getEffectiveUserEntitlements` directly — see "Plan-based suspension" below for why.
 
 ## Firestore document
 
@@ -46,13 +53,13 @@ exactly. Only server code (Admin SDK) may read or write it.
 | `authUid` | string | The Firebase Auth UID of *this specific installation*. For Camera, this is `cameraAuthUid` (the anonymous auth identity created by `createCameraPairingSession`); for Home, it's whichever Firebase Auth UID (anonymous or Google-linked) was active when the device was first registered. Immutable once set — see "Identity is never overwritten" below. |
 | `ownerUid` | string \| null | For `HOME`: always equal to `authUid` (a Home device is self-owned). For `CAMERA`: `null` before pairing, the linked Home owner's uid after a successful claim, `null` again after a normal unpair. |
 | `status` | `"active" \| "suspended" \| "revoked"` | Administrative trust state — see "status vs. pairing status" below. |
-| `suspensionReason` | `"plan" \| "manual" \| "security" \| null` | *Why* the device is suspended — only meaningful while `status == "suspended"`. `null` for every device this stage creates, and never set to anything else by this stage (there is no suspend operation yet — see "What is enforced today" below). Kept as its own field, separate from `status`, so a future suspend operation can record a reason without overloading `status` itself with more values. |
+| `suspensionReason` | `"plan" \| "manual" \| "security" \| null` | *Why* the device is suspended — only meaningful while `status == "suspended"`. `null` for a device with `status != "suspended"`. `"plan"` is the only value any server code sets automatically today (`reconcileUserDeviceLimits`, see "Plan-based suspension" below); `"manual"`/`"security"` exist in the schema for a human operator to set directly (e.g. via the Firebase console/Admin SDK, not through any callable in this project) and are never touched, set, or interpreted by anything in this file except to guarantee they are never auto-reactivated. |
 | `identityMode` | `"legacy" \| "keystore"` | Every device is created `"legacy"` (see "Legacy has no cryptographic proof" below). Flips to `"keystore"` exactly once, atomically with `publicKey`, via `registerDevicePublicKey` — see "Android Keystore identity" below. Never flips back. |
 | `publicKey` | string \| null | `null` until the device registers a real key. From then on, the canonical Base64 (standard alphabet, no wrapping) encoding of the device's X.509 SubjectPublicKeyInfo (SPKI) DER bytes — the full public key, not a fingerprint (see "Key format" below). Never replaced, cleared, or downgraded back to `null` once set. |
 | `createdAt` | Timestamp | Set once, at first creation. Never changes after. |
 | `updatedAt` | Timestamp | Bumped on every meaningful change (including a lazy-migration touch). |
 | `lastSeenAt` | Timestamp | Bumped whenever the device is confirmed active through an authenticated server call. |
-| `revokedAt` | Timestamp \| null | Set only by an explicit future revocation operation (not implemented in this stage) — never touched by any of the operations described below. |
+| `revokedAt` | Timestamp \| null | Set once, only by `revokeRegisteredDevice` (see "Explicit revoke" below), and never changed again — a repeat revoke is idempotent and leaves the original value untouched. `null` for every device that has never been revoked. |
 
 ## `status` vs. pairing status
 
@@ -68,15 +75,322 @@ exactly. Only server code (Admin SDK) may read or write it.
 
 The two are deliberately kept separate and are not cross-referenced by this stage.
 
-## Why a normal unpair is not `revoked`
+## `unpair` ≠ `suspend` ≠ `revoke`
 
-Unpairing is an everyday, expected action (the user removing a camera, or a camera being
-re-purposed) — it says nothing about whether the physical device or its credentials should ever be
-trusted again. `detachCameraOwner()` (called from `releaseCameraForUser`, `unpairCameraFromDevice`,
-and `releaseCameraFromCamera`, right after each already deletes the `cameraClaims` ownership link)
-only ever clears `ownerUid` back to `null` and bumps `updatedAt`/`lastSeenAt` — `status` is never
-touched. `revoked` is reserved for a distinct, explicit, not-yet-implemented action ("this specific
-credential must never be trusted again, even if presented for a brand-new pairing").
+Three genuinely different operations, easy to conflate, kept strictly separate:
+
+- **Unpair** (`releaseCameraForUser`/`unpairCameraFromDevice`/`releaseCameraFromCamera`, all via
+  `detachCameraOwner()`) is an everyday, expected action (the user removing a camera, or a camera
+  being re-purposed) — it says nothing about whether the physical device or its credentials should
+  ever be trusted again. For an `active` or `suspended` device it only ever clears `ownerUid` back
+  to `null` and bumps `updatedAt`/`lastSeenAt`. `status`, `suspensionReason`, `identityMode`,
+  `publicKey`, and `revokedAt` are never touched — an unpaired device stays exactly as trusted (or
+  untrusted) as it was the moment before.
+
+  **`revoked` cleanup ≠ registry detach.** For a `revoked` device, `detachCameraOwner()` is a
+  complete no-op on `registeredDevices` — `ownerUid` (and every other field, including
+  `updatedAt`/`lastSeenAt`) is left untouched. The *pairing* artifacts (`cameraClaims`,
+  `pairingState`, the owner's `cameraDevices` entry) are still deleted/updated normally by the
+  caller before `detachCameraOwner()` even runs — Home must still be able to remove a revoked
+  camera from its device list — but that is cleaning up pairing state, not the registry's own
+  audit trail. Revoked is a terminal security state: clearing `ownerUid` here would permanently
+  erase the record of who owned/reported the device, exactly the fact `revokeRegisteredDevice`
+  exists to preserve. See "Explicit revoke" below.
+- **Suspend** (`reconcileUserDeviceLimits`, always with `suspensionReason: "plan"` when set
+  automatically) is a *reversible*, plan-driven state: the owner currently has more devices of one
+  role than their plan allows, so the newest excess devices are suspended until the limit rises
+  again (or the owner removes/revokes enough others). `ownerUid` is never touched — a suspended
+  device still belongs to its owner, it just can't perform operational actions right now (see
+  "Centralized operational enforcement" below).
+- **Revoke** (`revokeRegisteredDevice`) is the *irreversible* one: "this specific credential must
+  never be trusted again, even if presented for a brand-new pairing." Explicit and owner-triggered
+  only — nothing in this project ever revokes a device automatically. See "Explicit revoke" below.
+
+## Explicit revoke: `revokeRegisteredDevice`
+
+A callable Cloud Function, region `europe-west1`, that lets a device's current owner mark it
+permanently untrusted (e.g. the physical device was lost or stolen).
+
+Request/response:
+
+```typescript
+// request
+{ deviceId: string }
+
+// response
+{ success: true, status: "revoked", alreadyRevoked: boolean }
+```
+
+**Authorization**: `request.auth != null`, and the caller's uid must equal the *stored*
+`registeredDevices/{deviceId}.ownerUid` — never anything the client asserts about role, authUid, or
+status in the request body (only `deviceId` is ever read from it). A device with `ownerUid == null`
+(never claimed, or already unpaired) can never be revoked by a client — there is no owner to
+authorize the caller against.
+
+**Errors** (`HttpsError`, code / message):
+
+| Code | Message | Meaning |
+|---|---|---|
+| `unauthenticated` | `UNAUTHENTICATED` | No `request.auth`. |
+| `invalid-argument` | `INVALID_DEVICE_ID` | Not a string, blank after trim, or over 128 characters. |
+| `not-found` | `DEVICE_NOT_REGISTERED` | `registeredDevices/{deviceId}` does not exist. |
+| `failed-precondition` | `DEVICE_NOT_OWNED` | The stored document's `ownerUid` is `null`. |
+| `permission-denied` | `PERMISSION_DENIED` | The caller's uid does not match the stored `ownerUid`. |
+| `internal` | `REGISTRY_WRITE_FAILED` | A genuine Firestore/transaction failure — never silently reported as success. |
+
+**Transaction** (`applyRevokeRegisteredDevice`/`decideRevokeRegisteredDevice` in
+`deviceRegistry.ts`): sets `status: "revoked"`, `revokedAt: <server timestamp>`,
+`suspensionReason: null`, `updatedAt: <server timestamp>`. Every other field — `deviceId`, `role`,
+`authUid`, `ownerUid`, `identityMode`, `publicKey`, `createdAt`, `lastSeenAt` — is left completely
+untouched. `ownerUid` in particular is **never** cleared by revoke (unlike unpair) — it remains the
+record of who revoked the device, needed for an owner's device list and for audit purposes.
+
+**Idempotent**: revoking an already-`revoked` device returns `{ success: true, status: "revoked",
+alreadyRevoked: true }`, and neither `revokedAt` nor `updatedAt` is touched on the repeat.
+
+**Forbidden, by construction** — there is no `unrevokeDevice` callable, and nothing in this project
+ever transitions a device `revoked → active` or `revoked → suspended`, automatically or via any
+client-reachable path:
+
+- a client cannot restore a revoked device to active;
+- a client cannot change `revokedAt` once set;
+- a client cannot revoke a device it does not own;
+- a client cannot revoke a device with `ownerUid == null`;
+- a client cannot clear a revoked device's `ownerUid` via unpair/cleanup either — see "`revoked`
+  cleanup ≠ registry detach" above;
+- `reconcileUserDeviceLimits` (see below) excludes `revoked` devices from its selection entirely —
+  they are never counted toward a limit and never reactivated by a limit increase (this is
+  different from `suspended`/`"manual"`/`"security"` devices, which **do** count toward the limit
+  but are likewise never auto-reactivated — see "Plan-based suspension" below for the distinction);
+- every lazy-registration path (`registerLegacyCamera`/`registerLegacyHome`/`attachCameraOwner`/
+  `touchRegisteredDevice`) already never writes `status` on an existing document (see
+  "Administrative status and Keystore identity are never downgraded" below) — this was true before
+  revoke existed and remains the reason a revoked device can't be silently resurrected by an
+  ordinary pairing/TURN/event call either.
+
+## Plan-based suspension: `reconcileUserDeviceLimits`
+
+A server-only helper (`functions/src/deviceRegistry.ts`, not a callable — only ever invoked by
+`reconcileDevicesOnEntitlementChange`, see below) that brings one user's owned, non-`revoked`
+devices in line with their current plan limits, **independently per role**:
+
+```typescript
+reconcileUserDeviceLimits(
+  db: admin.firestore.Firestore,
+  ownerUid: string,
+  limits: { maxCameras: number; maxHomeDevices: number }
+): Promise<{
+  camerasSuspended: number;
+  camerasReactivated: number;
+  homeDevicesSuspended: number;
+  homeDevicesReactivated: number;
+}>
+```
+
+**Counted devices** (occupy a plan slot): every device with `ownerUid == ownerUid` and `status !=
+"revoked"` — that includes `active`, `suspended`/`"plan"`, `suspended`/`"manual"`, **and**
+`suspended`/`"security"`. A device with `ownerUid == null` never belongs to any user's limit and is
+excluded by the query itself; `revoked` devices are excluded explicitly (never counted, never
+reactivated, regardless of how high the limit rises).
+
+**`suspended`/`"manual"` and `suspended`/`"security"` devices count toward the limit, but their own
+status is never automatically changed, in either direction.** This is a real, deliberate
+distinction from `revoked` — do not read "manual/security are excluded from selection" anywhere in
+this document as "excluded from the count": they occupy a slot exactly like an `active` device
+does, which can push a *later* device into excess, or leave a slot open for an *earlier* one — they
+are simply never themselves the thing this function suspends further or reactivates. See the
+worked example below.
+
+**Deterministic selection** (`planDeviceLimitDecision`, a pure function directly unit-testable),
+per role:
+
+1. Sort every counted device by `createdAt` ascending, `deviceId` ascending on an exact tie —
+   **never** `lastSeenAt` (using recency would make the "within plan" set drift every time a
+   device happens to be used, breaking reproducibility).
+2. The first `limit` devices in that order are **within plan**; the rest are **excess**.
+3. Within plan: `active` stays `active`; `suspended`/`"plan"` is reactivated to `active`;
+   `suspended`/`"manual"` and `suspended`/`"security"` stay exactly as they are.
+4. Excess: `active` becomes `suspended`/`"plan"`; `suspended`/`"plan"` stays `suspended`/`"plan"`;
+   `suspended`/`"manual"` and `suspended`/`"security"` stay exactly as they are.
+
+A manual/security reason is **never** rewritten to `"plan"`, in either direction, regardless of
+whether the device ends up within plan or excess. A device already in its correct target state
+produces no write at all (no `updatedAt` bump on a no-op), which is what makes a repeated reconcile
+with the same limit fully idempotent.
+
+**Worked example** (`limit = 1`): `A` (`suspended`/`"manual"`, created first), `B` (`active`,
+created second). `A` occupies the only slot (it's oldest) — result: `A` stays
+`suspended`/`"manual"` (within plan, but manual is never auto-reactivated), `B` becomes
+`suspended`/`"plan"` (excess, since `A` took the slot) — even though `A` itself never stops being
+operationally suspended. Raising the limit to `2`: both are now within plan — `A` still stays
+`suspended`/`"manual"` (never auto-reactivated), `B` (whose reason is `"plan"`) becomes `active`.
+
+**Consistency model**: the counted-device set is read with one non-transactional, single-field
+query (`where("ownerUid", "==", ownerUid)`, filtered further to role/non-revoked in memory —
+deliberately avoiding a multi-field composite query, which would require a new Firestore index this
+project does not otherwise have). Each individual device's actual state change is then applied in
+its **own** small transaction (`applyDevicePlanLimitChange`), which **re-reads that device fresh**
+and re-validates it is still eligible for an *automatic* transition (still `active` or still
+`suspended`/`"plan"` — never a manual/security suspension, which this never touches regardless)
+before writing — never trusting the earlier query snapshot as still current. This means a
+concurrent `revoke` or a concurrent manual/security suspension landing on any one device
+mid-reconcile can never be overridden by this pass, regardless of how many other devices the same
+reconcile also touches. Not a single all-or-nothing transaction across every device: a user's
+total owned-device count is expected to stay small (single digits to low tens) in practice, and
+per-device transactions keep write ordering simple without contending with every other concurrent
+operation on any of these
+documents at once, or needing Firestore's 500-operation batch/transaction limit.
+
+**Never touched by this function, for any device**: `ownerUid`, `authUid`, `role`, `identityMode`,
+`publicKey`, `createdAt`, `lastSeenAt`, `revokedAt`.
+
+## Automatic reconciliation on entitlement change: `reconcileDevicesOnEntitlementChange`
+
+A Firestore trigger (`onDocumentWritten`, region `europe-west1`) on `userEntitlements/{uid}` —
+fires on create, update, *and* delete.
+
+1. Computes `maxCameras`/`maxHomeDevices` for both the "before" and "after" state via
+   `planDeviceLimitsFromEntitlementsData` (a pure function — see "Plan device limits vs. effective
+   entitlements" below) — for delete, "after" naturally resolves to the Free defaults, the same
+   fallback `getPlanDeviceLimits` itself uses for "no document"; no separate Free-model duplication.
+2. **If both limits are unchanged, does nothing** — no read of `registeredDevices`, no write,
+   regardless of what else changed on the document (including `subscriptionStatus`).
+3. Otherwise calls `reconcileUserDeviceLimits(db, uid, afterLimits)`.
+
+**Idempotent and safe under at-least-once trigger delivery**: `reconcileUserDeviceLimits` itself
+only ever writes a device that is not already in its target state, so a redelivered event (or two
+firing back-to-back for the same uid) converges to the same result without any extra bookkeeping in
+this handler.
+
+## Plan device limits vs. effective entitlements
+
+Two deliberately different resolutions of the same `userEntitlements/{uid}` document, in
+`functions/src/entitlements.ts`:
+
+- **`getEffectiveUserEntitlements`** (pre-existing, unchanged) — the *operational* rights a caller
+  has right now. `subscriptionStatus == "blocked"` zeroes out `maxCameras`/`maxHomeDevices`/
+  `maxConcurrentLiveSessions` and denies `turnAccessAllowed`, on top of the missing/corrupt/expired
+  → Free fallback.
+- **`getPlanDeviceLimits`** / **`planDeviceLimitsFromEntitlementsData`** (new) — the *plan* device
+  limits only (`maxCameras`/`maxHomeDevices`), used **exclusively** by device-registry
+  reconciliation. Deliberately does **not** apply the `"blocked" → zero` rule:
+  `subscriptionStatus == "blocked"` is an operational access gate (denies TURN issuance etc.
+  through `getEffectiveUserEntitlements`), not a change to how many devices the user's plan
+  actually allows. Conflating the two would turn a simple subscription block into wrongly
+  suspending every device the user owns — exactly the `subscription blocked != device suspended`
+  distinction this stage keeps strict. An **expired** grant *is* still treated as a real downgrade
+  to Free device limits (unlike `blocked`) by both helpers, since expiry genuinely ends the grant
+  rather than merely gating access to it.
+
+Both share one internal resolution core (`resolveEntitlementsData`/`resolveStoredOrFreeEntitlements`
+in `entitlements.ts`) for the missing-document/corrupt-document/expired → Free fallback, so Free's
+definition is never duplicated between them.
+
+## Centralized operational enforcement: `checkRegisteredDeviceOperational`
+
+A pure function (`deviceRegistry.ts`) — `existing: RegisteredDevice | null` (the already-fetched
+document) in, a decision out:
+
+```typescript
+type DeviceOperationalReason =
+  | "DEVICE_SUSPENDED" | "DEVICE_SUSPENDED_PLAN" | "DEVICE_REVOKED" | "DEVICE_NOT_REGISTERED";
+
+type DeviceOperationalDecision =
+  | { operational: true }
+  | { operational: false; reason: DeviceOperationalReason };
+```
+
+| Stored state | Decision |
+|---|---|
+| `active` | operational |
+| `suspended`, `suspensionReason: "plan"` | not operational — `DEVICE_SUSPENDED_PLAN` |
+| `suspended`, `suspensionReason: "manual"` or `"security"` | not operational — `DEVICE_SUSPENDED` |
+| `revoked` | not operational — `DEVICE_REVOKED` |
+| no document at all | operational by default (`requireRegistered: false`) — see below |
+
+A missing document is **permissive by default**: this registry is still best-effort bookkeeping
+layered on top of `cameraClaims`/`pairingState` (the real sources of truth), not a hard
+prerequisite for every operation. A device that predates the registry, or whose lazy-migration
+write simply hasn't landed yet, must never be newly blocked because of that. (`requireRegistered:
+true` exists for a future call site that genuinely needs "must already be registered" — no current
+call site sets it; `revokeRegisteredDevice`'s own "can't revoke what doesn't exist" check is handled
+directly in `decideRevokeRegisteredDevice`, not routed through this function.)
+
+The actual `HttpsError` mapping (`assertRegisteredDeviceOperational` in `index.ts`) is deliberately
+**not** in `deviceRegistry.ts` — that module never imports `HttpsError`, so its business logic stays
+testable without the Functions SDK, exactly like `PublicKeyRegistrationOutcome`'s own mapping in
+`registerDevicePublicKey`. `DEVICE_SUSPENDED`/`DEVICE_SUSPENDED_PLAN`/`DEVICE_REVOKED` map to
+`failed-precondition`; `DEVICE_NOT_REGISTERED` maps to `not-found`. None of these reasons ever
+include a UID, a key, or any other document field — safe to return to the client verbatim.
+
+## Where operational enforcement is applied
+
+| Operation | `active` | `suspended` | `revoked` |
+|---|---|---|---|
+| `createCameraPairingSession` (start a new pairing) | allowed | **denied** | **denied** |
+| `claimCameraForUser` (complete a pairing) | allowed | **denied** | **denied** |
+| `getTurnCredentials` | allowed | **denied** | **denied** |
+| `submitCameraEvent` | allowed | **denied** | **denied** |
+| `registerDevicePublicKey` | allowed | **allowed** (completes the Keystore migration even while suspended) | **denied** |
+| `releaseCameraForUser` / `unpairCameraFromDevice` / `releaseCameraFromCamera` (unpair) | allowed — clears `ownerUid` | allowed — clears `ownerUid` | allowed, but **cleans up pairing artifacts only** — `registeredDevices.ownerUid`/`status`/`revokedAt`/`publicKey`/`identityMode` are left untouched (see "`revoked` cleanup ≠ registry detach") |
+| `revokeRegisteredDevice` | allowed | allowed | allowed (idempotent) |
+| WebRTC session / command creation (`webrtcSessions`, `commands`) | *(no server Function exists for this yet — see below)* | | |
+
+`registerDevicePublicKey`'s `suspended → allowed` behavior is intentional and unchanged from stage
+2 (`decidePublicKeyRegistration` in `deviceRegistry.ts` never checks `suspended` at all, only
+`revoked`) — a suspended device must still be able to finish proving its real cryptographic
+identity; that migration is exactly what stage 2 exists for, and blocking it would leave a
+suspended device permanently stuck in `"legacy"` even after the owner fixes their plan.
+
+Unpair, release, and revoke are **never** gated by device status — a lost/stolen/suspended device
+must always be removable/revocable, since blocking cleanup on the very state that motivates the
+cleanup would be a lockout, not a safeguard. For a `revoked` device specifically, "removable" means
+the *pairing* (Home's link to it) is removable — the registry's own record of `ownerUid`/`status`/
+`revokedAt`/the Keystore identity is not, and is never cleared by unpair/release. **`revoked`
+cleanup ≠ registry detach** — see above.
+
+`webrtcSessions`/`commands` (ACTIVITY_ZONE/ENTRY_EXIT_LINE/LIVE_VIEW signaling, UNPAIR/
+CONFIRM_PLACEMENT commands) are written directly by Home/Camera against Firestore, validated by
+`firestore.rules`, not through any Cloud Function — there is currently no server-side callable to
+apply this enforcement to for those paths. Documented here as a known, current gap rather than
+silently unaddressed: if a server-side function is ever added for that signaling, it should apply
+`assertRegisteredDeviceOperational` the same way `getTurnCredentials`/`submitCameraEvent` do.
+
+## Camera vs. Home status enforcement
+
+**Camera**: fully enforced. Every operational check above resolves the Camera's identity via
+`cameraClaims/{cameraDeviceId}.cameraAuthUid` — a server-verified value set once, at claim time,
+from the Camera's own authenticated pairing-session handshake. A request's `cameraDeviceId` is only
+ever trusted after this cross-check, never taken at face value.
+
+**Home: enforcement is intentionally NOT relied upon per-device today, and this is a real, open
+gap, not a solved problem.** The Home App does not yet have its own Keystore identity, challenge, or
+signed-request mechanism — Home requests are authenticated only by `request.auth.uid`, which today
+can be a Google-linked UID *shared across every Home installation signed into the same Google
+account*. Nothing server-side can yet cryptographically distinguish *which specific Home phone*
+issued a given request. Concretely:
+
+- `request.data.homeDeviceId == registeredDevices/{homeDeviceId}.someField` is **not**, on its own,
+  a safe per-device check — a client can assert any `homeDeviceId` string it wants, and nothing
+  proves the calling installation is the one that actually owns it.
+- `revokeRegisteredDevice` **does** correctly create `status: "revoked"` for a `HOME` device (the
+  callable and its authorization — `ownerUid == request.auth.uid` — are role-agnostic), which is
+  useful and real: it durably marks that specific `deviceId` as revoked in Firestore, and any
+  *future* per-device Home enforcement would immediately honor it retroactively. But **no code in
+  this project today denies any operation to a specific Home *installation* based on that revoked
+  status** — there is no server-side operation gated on "this specific calling Home device," only
+  account-level (`request.auth.uid`) checks, which revoking a `registeredDevices` document does not
+  touch or weaken.
+- Closing this gap requires: a Home Keystore identity (mirroring Camera's `identityMode: "keystore"`
+  migration), a challenge/signature scheme proving possession of that key on each sensitive
+  request, and anti-replay protection, followed by making the account-level checks (`isOwnerUid`
+  equivalents) *additionally* require that signature. None of that exists yet.
+
+This document must not be read as claiming Home devices are individually revocable/enforceable
+today — only that the **status itself** is now representable and durable, ready for the day
+per-device Home authentication exists. Existing account-level checks (`request.auth.uid ==
+cameraClaims.uid`, Firestore Rules' `isOwnerUid`) are unchanged and unweakened by any of this
+stage's work.
 
 ## Why `authUid` doesn't yet protect against copying a `deviceId`
 
@@ -276,6 +590,13 @@ reactivated/cleared by a later lazy-registration call, and that an already-provi
 identity (`identityMode: "keystore"`, a real `publicKey`) can never be downgraded back to
 `"legacy"` or have its key erased/replaced by this stage's legacy bookkeeping.
 
+`status`/`suspensionReason`/`revokedAt` are, today, only ever written by three functions total:
+`revokeRegisteredDevice` (`status: "revoked"`, one-way), `reconcileUserDeviceLimits`
+(`status`/`suspensionReason` toggling only between `active` and `suspended`/`"plan"`, and only for
+devices already in one of those two states — see "Plan-based suspension" above), and a device's own
+first creation (`status: "active"`, `suspensionReason: null`). No other function in this project
+writes any of these three fields.
+
 ## Lazy migration
 
 There is no bulk backfill script. Every `registeredDevices` document is created or updated
@@ -311,14 +632,38 @@ way.
 
 ## What is enforced today, and what isn't
 
-Enforced: a device can safely and durably register its real Keystore public key
-(`registerDevicePublicKey`), atomically flipping `identityMode` from `"legacy"` to `"keystore"`,
-first-write-wins, never replaceable. Nothing outside `deviceRegistry.ts`/`registerDevicePublicKey`
-reads or acts on `registeredDevices` yet.
+**Enforced:**
+- A device can safely and durably register its real Keystore public key
+  (`registerDevicePublicKey`), atomically flipping `identityMode` from `"legacy"` to `"keystore"`,
+  first-write-wins, never replaceable.
+- An owner can explicitly, durably, and idempotently revoke a device they own
+  (`revokeRegisteredDevice`) — irreversible, never auto-reactivated.
+- A user's device counts are automatically kept in line with their plan's `maxCameras`/
+  `maxHomeDevices` (`reconcileUserDeviceLimits`, triggered by `reconcileDevicesOnEntitlementChange`
+  whenever those limits actually change) — deterministic selection, per-role, never touching a
+  manual/security suspension or a revocation.
+- `registeredDevices.status` now actually gates real operations for **Camera**: pairing
+  start/completion, TURN credential issuance, and event submission all require `status == "active"`
+  (see "Where operational enforcement is applied" above). `registerDevicePublicKey` deliberately
+  remains allowed while `suspended` (only `revoked` blocks it), and unpair/release/revoke are never
+  gated by status at all.
+- `subscriptionStatus == "blocked"` and `registeredDevices.status` are kept strictly independent —
+  a subscription block alone never suspends or revokes a device (see "Plan device limits vs.
+  effective entitlements" above).
 
-Not enforced (explicitly out of scope for this stage): device-count limits, Live View denial,
-**signature verification of any request** (a registered public key is not yet used to verify
-anything — no challenge, no proof-of-possession check on subsequent calls), replacing
-`cameraClaims` or `pairingState`, and anything touching
-`userEntitlements`/`cameraCount`/`cameraLimit`. Challenge/signature verification, and later,
-actual enforcement based on `identityMode`/`status`, are explicitly separate, later tasks.
+**Not enforced / explicitly out of scope:**
+- **Signature verification of any request** — a registered public key is not yet used to verify
+  anything on subsequent calls (no challenge, no proof-of-possession check). Both Camera and Home
+  remain authenticated only by their Firebase Auth uid (Camera's cryptographically anchored via
+  `cameraClaims.cameraAuthUid`; Home's not per-device-distinguishable at all — see "Camera vs. Home
+  status enforcement" above).
+- **Per-device Home enforcement** — `registeredDevices.status` for a `HOME` device is correctly
+  representable (including `revoked`, via `revokeRegisteredDevice`) but nothing server-side today
+  denies an operation to one specific Home installation based on it. This is the single biggest
+  remaining gap in this stage and must not be described as solved.
+- **`webrtcSessions`/`commands` enforcement** — these are written directly by clients against
+  Firestore Rules, not through a Cloud Function; there is no server-side call site to apply
+  `assertRegisteredDeviceOperational` to yet.
+- Replacing `cameraClaims` or `pairingState` as the pairing/ownership source of truth.
+- Concurrent Live View session limits (`maxConcurrentLiveSessions` remains unread by any server
+  code).

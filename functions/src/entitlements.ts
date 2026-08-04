@@ -200,6 +200,55 @@ export function isExpired(stored: UserEntitlements, nowMillis: number = Date.now
   return stored.validUntil !== null && stored.validUntil.toMillis() <= nowMillis;
 }
 
+// Resolves a RAW userEntitlements document's data (or undefined, meaning "no document") to the
+// stored-or-Free-fallback rules shared by every consumer below (missing/corrupt/expired -> Free) --
+// WITHOUT touching Firestore itself. `subscriptionStatus` is carried on the return value so
+// getEffectiveUserEntitlements (the only caller that cares) can still apply its own "blocked ->
+// zeroed rights" rule on top; every other field already reflects the fully-resolved rights.
+// Exported as planDeviceLimitsFromEntitlementsData below for callers (e.g. a Firestore trigger's
+// event.data.before/after) that already have a raw snapshot's data() in hand and must not
+// re-fetch it -- by the time such a handler runs, "before" is no longer the live document.
+function resolveEntitlementsData(
+  data: FirebaseFirestore.DocumentData | undefined
+): { subscriptionStatus: EntitlementSubscriptionStatus } & EffectiveUserEntitlements {
+  if (!data) {
+    return { ...freeEntitlements() };
+  }
+
+  const parsed = parseUserEntitlements(data);
+
+  if (!parsed.valid) {
+    logger.warn("USER_ENTITLEMENTS_CORRUPT_DOCUMENT_FALLBACK_FREE", {
+      reason: parsed.reason,
+      ...(parsed.schemaVersion !== null ? { schemaVersion: parsed.schemaVersion } : {}),
+    });
+    return { ...freeEntitlements() };
+  }
+
+  const stored = parsed.value;
+
+  if (isExpired(stored)) {
+    return { ...freeEntitlements() };
+  }
+
+  return {
+    plan: stored.plan,
+    subscriptionStatus: stored.subscriptionStatus,
+    maxCameras: stored.maxCameras,
+    maxHomeDevices: stored.maxHomeDevices,
+    maxConcurrentLiveSessions: stored.maxConcurrentLiveSessions,
+    turnAccessAllowed: stored.turnAccessAllowed,
+  };
+}
+
+async function resolveStoredOrFreeEntitlements(
+  uid: string,
+  db: admin.firestore.Firestore
+): Promise<{ subscriptionStatus: EntitlementSubscriptionStatus } & EffectiveUserEntitlements> {
+  const snap = await db.collection("userEntitlements").doc(uid).get();
+  return resolveEntitlementsData(snap.exists ? snap.data() : undefined);
+}
+
 // Reads userEntitlements/{uid} and returns the already-safe effective
 // rights this uid actually has right now:
 //  - No document at all -> Free defaults. Never creates the document as a
@@ -227,27 +276,11 @@ export async function getEffectiveUserEntitlements(
   uid: string,
   db: admin.firestore.Firestore = admin.firestore()
 ): Promise<EffectiveUserEntitlements> {
-  const snap = await db.collection("userEntitlements").doc(uid).get();
+  const resolved = await resolveStoredOrFreeEntitlements(uid, db);
 
-  if (!snap.exists) {
-    return freeEntitlements();
-  }
-
-  const parsed = parseUserEntitlements(snap.data());
-
-  if (!parsed.valid) {
-    logger.warn("USER_ENTITLEMENTS_CORRUPT_DOCUMENT_FALLBACK_FREE", {
-      reason: parsed.reason,
-      ...(parsed.schemaVersion !== null ? { schemaVersion: parsed.schemaVersion } : {}),
-    });
-    return freeEntitlements();
-  }
-
-  const stored = parsed.value;
-
-  if (stored.subscriptionStatus === "blocked") {
+  if (resolved.subscriptionStatus === "blocked") {
     return {
-      plan: stored.plan,
+      plan: resolved.plan,
       subscriptionStatus: "blocked",
       maxCameras: 0,
       maxHomeDevices: 0,
@@ -256,16 +289,50 @@ export async function getEffectiveUserEntitlements(
     };
   }
 
-  if (isExpired(stored)) {
-    return freeEntitlements();
-  }
-
   return {
-    plan: stored.plan,
-    subscriptionStatus: stored.subscriptionStatus,
-    maxCameras: stored.maxCameras,
-    maxHomeDevices: stored.maxHomeDevices,
-    maxConcurrentLiveSessions: stored.maxConcurrentLiveSessions,
-    turnAccessAllowed: stored.turnAccessAllowed,
+    plan: resolved.plan,
+    subscriptionStatus: resolved.subscriptionStatus,
+    maxCameras: resolved.maxCameras,
+    maxHomeDevices: resolved.maxHomeDevices,
+    maxConcurrentLiveSessions: resolved.maxConcurrentLiveSessions,
+    turnAccessAllowed: resolved.turnAccessAllowed,
   };
+}
+
+// The device-count limits (only) a user's plan actually entitles them to -- for device registry
+// reconciliation (deviceRegistry.ts's reconcileUserDeviceLimits) ONLY, never for operational
+// access decisions (use getEffectiveUserEntitlements/turnAccessAllowed for those). Deliberately
+// does NOT apply getEffectiveUserEntitlements' "blocked -> zeroed rights" rule:
+// subscriptionStatus == "blocked" is an operational access gate (denies TURN issuance etc.), not a
+// change to how many devices the user's plan actually allows -- conflating the two would turn a
+// simple subscription block into wrongly suspending every device the user owns, which this
+// project's device-status model explicitly keeps separate (pairing state, device status, and
+// subscription status are three independent axes -- see docs/DEVICE_REGISTRY.md). Still applies
+// the same missing-document/corrupt-document/expired -> Free fallback as
+// getEffectiveUserEntitlements (an expired grant is a REAL downgrade, unlike blocked), sharing the
+// exact same resolution logic so Free's definition is never duplicated.
+export interface DeviceLimits {
+  maxCameras: number;
+  maxHomeDevices: number;
+}
+
+export async function getPlanDeviceLimits(
+  uid: string,
+  db: admin.firestore.Firestore = admin.firestore()
+): Promise<DeviceLimits> {
+  const resolved = await resolveStoredOrFreeEntitlements(uid, db);
+  return { maxCameras: resolved.maxCameras, maxHomeDevices: resolved.maxHomeDevices };
+}
+
+// Pure variant of getPlanDeviceLimits for a caller that already has a raw userEntitlements
+// document's data() in hand (or undefined for "no document") and must not perform a fresh
+// Firestore read -- see resolveEntitlementsData's own doc for why. Exported for direct unit
+// testing without a Firestore emulator, and used by reconcileDevicesOnEntitlementChange
+// (index.ts) to compute both the "before" and "after" limits from a single trigger event without
+// re-fetching either state from Firestore.
+export function planDeviceLimitsFromEntitlementsData(
+  data: FirebaseFirestore.DocumentData | undefined
+): DeviceLimits {
+  const resolved = resolveEntitlementsData(data);
+  return { maxCameras: resolved.maxCameras, maxHomeDevices: resolved.maxHomeDevices };
 }

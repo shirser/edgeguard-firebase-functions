@@ -1,11 +1,11 @@
-import { onDocumentCreated } from "firebase-functions/v2/firestore";
+import { onDocumentCreated, onDocumentWritten } from "firebase-functions/v2/firestore";
 import { onValueWritten } from "firebase-functions/v2/database";
 import { onCall, HttpsError } from "firebase-functions/v2/https";
 import { defineSecret } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 import * as crypto from "crypto";
-import { getEffectiveUserEntitlements } from "./entitlements";
+import { getEffectiveUserEntitlements, planDeviceLimitsFromEntitlementsData } from "./entitlements";
 import {
   registerLegacyCamera,
   registerLegacyHome,
@@ -15,14 +15,19 @@ import {
   validateEcP256PublicKey,
   applyPublicKeyRegistration,
   applyCameraPublicKeyRegistration,
+  applyRevokeRegisteredDevice,
+  checkRegisteredDeviceOperational,
+  reconcileUserDeviceLimits,
 } from "./deviceRegistry";
-import type { PublicKeyRegistrationOutcome } from "./deviceRegistry";
+import type { PublicKeyRegistrationOutcome, RegisteredDevice, RevokeDeviceDecision } from "./deviceRegistry";
 
 admin.initializeApp();
 
 export {
   ENTITLEMENTS_SCHEMA_VERSION,
   getEffectiveUserEntitlements,
+  getPlanDeviceLimits,
+  planDeviceLimitsFromEntitlementsData,
   isExpired as isUserEntitlementsExpired,
 } from "./entitlements";
 export type {
@@ -32,6 +37,7 @@ export type {
   UserEntitlements,
   EffectiveUserEntitlements,
   CorruptEntitlementsReason,
+  DeviceLimits,
 } from "./entitlements";
 
 export {
@@ -46,6 +52,11 @@ export {
   validateEcP256PublicKey,
   applyPublicKeyRegistration,
   applyCameraPublicKeyRegistration,
+  decideRevokeRegisteredDevice,
+  applyRevokeRegisteredDevice,
+  checkRegisteredDeviceOperational,
+  planDeviceLimitDecision,
+  reconcileUserDeviceLimits,
 } from "./deviceRegistry";
 export type {
   DeviceRole,
@@ -57,10 +68,43 @@ export type {
   PublicKeyInvalidReason,
   PublicKeyValidation,
   PublicKeyRegistrationOutcome,
+  RevokeDeviceDecision,
+  DeviceOperationalReason,
+  DeviceOperationalDecision,
+  DeviceLimitReconciliation,
 } from "./deviceRegistry";
 
 function hashSecret(secret: string): string {
   return crypto.createHash("sha256").update(secret).digest("hex");
+}
+
+// Throwing wrapper around deviceRegistry.ts's checkRegisteredDeviceOperational -- deviceRegistry.ts
+// itself deliberately never imports HttpsError (every operation there returns a plain outcome, so
+// its business logic stays testable without the Functions SDK), so the actual HttpsError mapping
+// lives here, mirroring how registerDevicePublicKey's own switch statement maps
+// PublicKeyRegistrationOutcome onto HttpsError below.
+//
+// Reads registeredDevices/{deviceId} fresh (not via a transaction) -- every call site below
+// already completed its own authorization transaction/read (attachCameraOwner's lazy migration,
+// or the claim transaction itself) before reaching this check, so this is a best-effort-adjacent
+// read consistent with how the rest of this stage's lazy migration already treats the registry:
+// authoritative for status/suspensionReason, but never the FIRST or ONLY check standing between a
+// request and the operation it performs.
+//
+// options.requireRegistered defaults to false (permissive on a missing document) -- see
+// checkRegisteredDeviceOperational's own doc for why every call site below relies on that default.
+async function assertRegisteredDeviceOperational(
+  db: admin.firestore.Firestore,
+  deviceId: string,
+  options: { requireRegistered?: boolean } = {}
+): Promise<void> {
+  const snap = await db.collection("registeredDevices").doc(deviceId).get();
+  const existing = snap.exists ? (snap.data() as RegisteredDevice) : null;
+  const decision = checkRegisteredDeviceOperational(existing, options);
+  if (decision.operational) return;
+
+  logger.info("DEVICE_OPERATIONAL_CHECK_DENIED", { deviceId, reason: decision.reason });
+  throw new HttpsError(decision.reason === "DEVICE_NOT_REGISTERED" ? "not-found" : "failed-precondition", decision.reason);
 }
 
 async function isNotificationEnabled(
@@ -205,6 +249,13 @@ export const createCameraPairingSession = onCall(
     // already-paired Camera (e.g. reopening the pairing screen without unpairing first).
     await registerLegacyCamera(db, cameraDeviceId, request.auth.uid);
 
+    // Device-status enforcement: a suspended/revoked Camera may not start a new pairing session
+    // (this would otherwise let a lost/stolen, already-revoked Camera re-pair to a brand-new Home
+    // account). Permissive on a missing registry document (see
+    // assertRegisteredDeviceOperational's own doc) -- a brand-new Camera's very first pairing
+    // request is never blocked by this.
+    await assertRegisteredDeviceOperational(db, cameraDeviceId);
+
     const pairingRef = db.collection("cameraPairingSessions").doc();
     const pairingId = pairingRef.id;
     const expiresAt = admin.firestore.Timestamp.fromMillis(
@@ -290,11 +341,14 @@ export const claimCameraForUser = onCall(
 
     const secretHash = hashSecret(pairingSecret);
 
+    const registryRef = db.collection("registeredDevices").doc(cameraDeviceId);
+
     const txResult = await db.runTransaction(async (t) => {
-      const [userSnap, claimSnap, pairingSnap] = await Promise.all([
+      const [userSnap, claimSnap, pairingSnap, registrySnap] = await Promise.all([
         t.get(userRef),
         t.get(claimRef),
         t.get(pairingRef),
+        t.get(registryRef),
       ]);
 
       // Validate pairing session
@@ -314,6 +368,21 @@ export const claimCameraForUser = onCall(
       if (!pairingValid) {
         logger.info("CLAIM_CAMERA_INVALID_PAIRING", { cameraDeviceId, pairingId });
         throw new HttpsError("failed-precondition", "INVALID_PAIRING");
+      }
+
+      // Device-status enforcement: a suspended/revoked Camera may not complete a claim (covers
+      // both a brand-new claim and the idempotent already-claimed-by-this-owner branch below).
+      // Read inside this same transaction (not via assertRegisteredDeviceOperational's own
+      // separate read) so this decision is atomic with the rest of the claim. Permissive on a
+      // missing registry document -- see checkRegisteredDeviceOperational's own doc.
+      const registryExisting = registrySnap.exists ? (registrySnap.data() as RegisteredDevice) : null;
+      const operational = checkRegisteredDeviceOperational(registryExisting);
+      if (!operational.operational) {
+        logger.info("CLAIM_CAMERA_DEVICE_STATUS_DENIED", { cameraDeviceId, reason: operational.reason });
+        throw new HttpsError(
+          operational.reason === "DEVICE_NOT_REGISTERED" ? "not-found" : "failed-precondition",
+          operational.reason
+        );
       }
 
       // Idempotent: already claimed by this user
@@ -953,6 +1022,9 @@ export const submitCameraEvent = onCall(
     // check above has already succeeded. Never blocks or changes this function's response.
     await attachCameraOwner(db, cameraDeviceId, linkedCameraAuthUid, claimSnap.get("uid") as string);
 
+    // Device-status enforcement: a suspended/revoked Camera may not submit an event.
+    await assertRegisteredDeviceOperational(db, cameraDeviceId);
+
     await handleCameraEvent(db, cameraDeviceId, type, title, body, severity);
 
     logger.info("SUBMIT_CAMERA_EVENT_SUCCESS", { cameraDeviceId, type });
@@ -1147,11 +1219,14 @@ export const getTurnCredentials = onCall(
     // blocks or changes this function's response.
     await attachCameraOwner(db, cameraDeviceId, claim.cameraAuthUid, claim.ownerUid as string);
 
+    // Device-status enforcement: a suspended/revoked Camera may not vend TURN credentials to
+    // either side of the call (Home requesting as viewer, or Camera requesting as responder).
+    await assertRegisteredDeviceOperational(db, cameraDeviceId);
+
     // Entitlements gate: only turnAccessAllowed is enforced here today.
     // maxCameras/maxHomeDevices/maxConcurrentLiveSessions are intentionally
-    // NOT checked yet -- they require a device registry and server-side
-    // Live View session tracking that don't exist yet (later work). Never
-    // surface *why* TURN was denied (plan, blocked status, expiry) to the
+    // NOT checked yet -- concurrent Live View session tracking doesn't exist yet (later work).
+    // Never surface *why* TURN was denied (plan, blocked status, expiry) to the
     // client -- only the generic TURN_ACCESS_DENIED code.
     const entitlements = await getEffectiveUserEntitlements(uid, db);
     if (!entitlements.turnAccessAllowed) {
@@ -1321,6 +1396,114 @@ export const registerDevicePublicKey = onCall(
       default:
         throw new HttpsError("internal", "INTERNAL");
     }
+  }
+);
+
+// Explicit revocation for a lost/stolen device -- a distinct, owner-triggered action, deliberately
+// separate from a normal unpair (releaseCameraForUser/unpairCameraFromDevice/
+// releaseCameraFromCamera, which only ever clear ownerUid via detachCameraOwner and never touch
+// status). See docs/DEVICE_REGISTRY.md.
+//
+// Authorization: request.auth != null, and the caller's uid must equal the STORED
+// registeredDevices/{deviceId}.ownerUid -- never anything the client asserts in the request body
+// (only `deviceId` is ever read from it). A device with ownerUid == null (never claimed, or
+// already unpaired) can never be revoked this way -- see decideRevokeRegisteredDevice's own doc.
+//
+// For HOME devices specifically: this creates a correct `revoked` status server-side, but does
+// NOT yet cryptographically verify *which* Home installation is making this call -- Home devices
+// are not yet authenticated via their own Keystore identity/signature (only Camera is, via
+// cameraClaims.cameraAuthUid elsewhere in this file), so `ownerUid` here is only as strong as
+// whichever Firebase Auth UID the calling Home app currently holds. See docs/DEVICE_REGISTRY.md's
+// "What is enforced today, and what isn't" for the full gap -- this callable does not close it,
+// and this comment must not be read as a claim that it does.
+export const revokeRegisteredDevice = onCall(
+  { region: "europe-west1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "UNAUTHENTICATED");
+    }
+
+    const { deviceId } = request.data as { deviceId?: string };
+    if (typeof deviceId !== "string" || deviceId.trim().length === 0 || deviceId.length > MAX_DEVICE_ID_LENGTH) {
+      throw new HttpsError("invalid-argument", "INVALID_DEVICE_ID");
+    }
+
+    logger.info("REVOKE_REGISTERED_DEVICE_START", { deviceId });
+
+    const db = admin.firestore();
+
+    let decision: RevokeDeviceDecision;
+    try {
+      decision = await applyRevokeRegisteredDevice(db, deviceId, request.auth.uid);
+    } catch (error: any) {
+      logger.error("REVOKE_REGISTERED_DEVICE_FAILED", {
+        deviceId,
+        errorClass: error?.constructor?.name ?? "Error",
+      });
+      throw new HttpsError("internal", "REGISTRY_WRITE_FAILED");
+    }
+
+    switch (decision.outcome) {
+      case "not_found":
+        logger.info("REVOKE_REGISTERED_DEVICE_DENIED", { deviceId, reason: "DEVICE_NOT_REGISTERED" });
+        throw new HttpsError("not-found", "DEVICE_NOT_REGISTERED");
+      case "no_owner":
+        logger.info("REVOKE_REGISTERED_DEVICE_DENIED", { deviceId, reason: "DEVICE_NOT_OWNED" });
+        throw new HttpsError("failed-precondition", "DEVICE_NOT_OWNED");
+      case "owner_mismatch":
+        logger.info("REVOKE_REGISTERED_DEVICE_DENIED", { deviceId, reason: "PERMISSION_DENIED" });
+        throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+      case "revoked":
+        logger.info(
+          decision.alreadyRevoked ? "REVOKE_REGISTERED_DEVICE_IDEMPOTENT" : "REVOKE_REGISTERED_DEVICE_SUCCESS",
+          { deviceId }
+        );
+        return { success: true, status: "revoked" as const, alreadyRevoked: decision.alreadyRevoked };
+      default:
+        throw new HttpsError("internal", "INTERNAL");
+    }
+  }
+);
+
+// Automatically brings a user's registeredDevices in line whenever their plan device limits
+// (maxCameras/maxHomeDevices) actually change -- create, update, or delete of
+// userEntitlements/{uid}. Deliberately does NOT fire reconciliation for a change that leaves both
+// limits the same (e.g. subscriptionStatus flipping active <-> blocked alone, or any other field
+// changing) -- see entitlements.ts's planDeviceLimitsFromEntitlementsData for why "blocked" is
+// never treated as a limit change here. Idempotent and safe under Firestore's at-least-once
+// trigger delivery: reconcileUserDeviceLimits itself only ever writes a device that is not
+// already in its target state, so a redelivered event (or two of these firing back to back for
+// the same uid) converges to the same result without any extra bookkeeping in this handler.
+export const reconcileDevicesOnEntitlementChange = onDocumentWritten(
+  { document: "userEntitlements/{uid}", region: "europe-west1" },
+  async (event) => {
+    const beforeData = event.data?.before?.exists ? event.data.before.data() : undefined;
+    const afterData = event.data?.after?.exists ? event.data.after.data() : undefined;
+
+    const beforeLimits = planDeviceLimitsFromEntitlementsData(beforeData);
+    const afterLimits = planDeviceLimitsFromEntitlementsData(afterData);
+
+    if (beforeLimits.maxCameras === afterLimits.maxCameras && beforeLimits.maxHomeDevices === afterLimits.maxHomeDevices) {
+      logger.info("RECONCILE_DEVICES_ON_ENTITLEMENT_CHANGE_SKIPPED_NO_LIMIT_CHANGE", { operation: "entitlement_change" });
+      return;
+    }
+
+    logger.info("RECONCILE_DEVICES_ON_ENTITLEMENT_CHANGE_START", {
+      operation: "entitlement_change",
+      maxCameras: afterLimits.maxCameras,
+      maxHomeDevices: afterLimits.maxHomeDevices,
+    });
+
+    const result = await reconcileUserDeviceLimits(admin.firestore(), event.params.uid, afterLimits);
+
+    logger.info("RECONCILE_DEVICES_ON_ENTITLEMENT_CHANGE_DONE", {
+      operation: "entitlement_change",
+      changedCount:
+        result.camerasSuspended +
+        result.camerasReactivated +
+        result.homeDevicesSuspended +
+        result.homeDevicesReactivated,
+    });
   }
 );
 

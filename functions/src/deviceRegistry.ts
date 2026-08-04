@@ -1,6 +1,7 @@
 import * as admin from "firebase-admin";
 import * as logger from "firebase-functions/logger";
 import * as crypto from "crypto";
+import type { DeviceLimits } from "./entitlements";
 
 // Stage 1 of the EdgeGuard device registry: a single global, Admin-SDK-only collection that
 // records every known Camera/Home installation ("device") independently of cameraClaims/
@@ -235,10 +236,21 @@ export async function attachCameraOwner(
 // (releaseCameraForUser, unpairCameraFromDevice, releaseCameraFromCamera) right after the
 // existing cameraClaims deletion succeeds. A normal unpair is never a revocation: status,
 // suspensionReason, identityMode, publicKey, authUid, and revokedAt are never touched here. Safe
-// no-op if the
-// device was never registered, or if it's registered under a different role (defensive only --
-// cameraDeviceId/homeDeviceId occupy the same registeredDevices id space in principle, though in
-// practice they're generated independently and collisions are not expected).
+// no-op if the device was never registered, or if it's registered under a different role
+// (defensive only -- cameraDeviceId/homeDeviceId occupy the same registeredDevices id space in
+// principle, though in practice they're generated independently and collisions are not expected).
+//
+// `revoked` is the one status this never clears ownerUid for -- see docs/DEVICE_REGISTRY.md's
+// "unpair ≠ suspend ≠ revoke" section. Revoked is a terminal security state: the pairing/link
+// cleanup this function's callers already perform (deleting cameraClaims, writing
+// pairingState:"unpaired", etc., all done before this runs) is fine and expected -- Home must
+// still be able to remove a revoked camera from its device list -- but that is cleaning up
+// *pairing artifacts*, not the registry's own audit trail. If this cleared ownerUid the same way
+// it does for an active/suspended device, the registry would permanently lose the record of who
+// owned a revoked device, exactly the "who reported this device lost/stolen" fact revoke exists
+// to preserve. This is a complete no-op for a revoked device -- not even updatedAt/lastSeenAt are
+// touched -- so a repeated unpair/cleanup call against an already-revoked device is trivially
+// idempotent (nothing to converge to; there was never a write in the first place).
 export async function detachCameraOwner(db: admin.firestore.Firestore, cameraDeviceId: string): Promise<void> {
   const ref = registeredDeviceRef(db, cameraDeviceId);
   try {
@@ -249,6 +261,11 @@ export async function detachCameraOwner(db: admin.firestore.Firestore, cameraDev
       const existing = snap.data() as RegisteredDevice;
       if (existing.role !== "CAMERA") {
         logIdentityConflict("DEVICE_REGISTRY_DETACH_CAMERA_OWNER", cameraDeviceId, existing.role, "ROLE_MISMATCH");
+        return;
+      }
+
+      if (existing.status === "revoked") {
+        logger.info("DEVICE_REGISTRY_DETACH_CAMERA_OWNER_SKIPPED_REVOKED", { deviceId: cameraDeviceId });
         return;
       }
 
@@ -597,4 +614,323 @@ export async function applyCameraPublicKeyRegistration(
     });
     return finalizePublicKeyRegistrationDecision(t, ref, { deviceId: params.cameraDeviceId, role: "CAMERA" }, decision);
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Explicit revoke: revokeRegisteredDevice
+// ---------------------------------------------------------------------------------------------
+// A distinct, explicit, owner-triggered action ("this specific credential must never be trusted
+// again") -- deliberately separate from a normal unpair (detachCameraOwner above), which only
+// ever clears ownerUid and never touches status. See docs/DEVICE_REGISTRY.md.
+
+export type RevokeDeviceDecision =
+  | { outcome: "revoked"; alreadyRevoked: true }
+  | { outcome: "revoked"; alreadyRevoked: false; writeFields: Record<string, unknown> }
+  | { outcome: "not_found" }
+  | { outcome: "no_owner" }
+  | { outcome: "owner_mismatch" };
+
+// Pure decision core for revokeRegisteredDevice -- takes the already-fetched document (or null)
+// and the authenticated caller's uid, never touches Firestore itself. Exported for direct unit
+// testing without a Firestore emulator.
+//
+// ownerUid is never cleared by revoke (unlike a normal unpair) -- it is the only record of who
+// revoked this device and remains needed for an owner's device list / audit trail. A device with
+// ownerUid == null (never claimed, or already unpaired) can never be revoked by a client: there is
+// no owner to authorize the caller against, and "revoke my lost device" only makes sense for a
+// device the caller currently owns.
+export function decideRevokeRegisteredDevice(
+  existing: RegisteredDevice | null,
+  requestingUid: string
+): RevokeDeviceDecision {
+  if (!existing) {
+    return { outcome: "not_found" };
+  }
+  if (existing.ownerUid === null) {
+    return { outcome: "no_owner" };
+  }
+  if (existing.ownerUid !== requestingUid) {
+    return { outcome: "owner_mismatch" };
+  }
+  if (existing.status === "revoked") {
+    // Idempotent: the original revokedAt is never touched, and updatedAt is not bumped for a
+    // no-op repeat call.
+    return { outcome: "revoked", alreadyRevoked: true };
+  }
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  return {
+    outcome: "revoked",
+    alreadyRevoked: false,
+    writeFields: {
+      status: "revoked",
+      revokedAt: now,
+      suspensionReason: null,
+      updatedAt: now,
+    },
+  };
+}
+
+// The strict, transactional revoke operation -- owner-only, idempotent, and never touches
+// deviceId/role/authUid/ownerUid/identityMode/publicKey/createdAt/lastSeenAt. Same
+// never-swallows-a-Firestore-error contract as applyPublicKeyRegistration: a genuine transaction
+// failure propagates as a real rejected promise, never silently reported as success.
+export async function applyRevokeRegisteredDevice(
+  db: admin.firestore.Firestore,
+  deviceId: string,
+  requestingUid: string
+): Promise<RevokeDeviceDecision> {
+  const ref = registeredDeviceRef(db, deviceId);
+
+  return db.runTransaction(async (t): Promise<RevokeDeviceDecision> => {
+    const snap = await t.get(ref);
+    const existing = snap.exists ? (snap.data() as RegisteredDevice) : null;
+    const decision = decideRevokeRegisteredDevice(existing, requestingUid);
+
+    if (decision.outcome === "revoked" && !decision.alreadyRevoked) {
+      t.set(ref, decision.writeFields, { merge: true });
+    }
+
+    return decision;
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Centralized operational-status enforcement: checkRegisteredDeviceOperational
+// ---------------------------------------------------------------------------------------------
+// The single, shared decision for "is this device currently allowed to perform an operational
+// action" (issuing TURN credentials, accepting a submitted event, completing a pairing/claim,
+// etc.) -- see docs/DEVICE_REGISTRY.md's operation/status matrix for exactly which call sites use
+// this and how. Every reason string here is fixed and safe to log/return to a client verbatim --
+// never includes a UID, a key, or any other document field.
+
+export type DeviceOperationalReason =
+  | "DEVICE_SUSPENDED"
+  | "DEVICE_SUSPENDED_PLAN"
+  | "DEVICE_REVOKED"
+  | "DEVICE_NOT_REGISTERED";
+
+export type DeviceOperationalDecision = { operational: true } | { operational: false; reason: DeviceOperationalReason };
+
+// Pure: `existing` is the already-fetched registeredDevices/{deviceId} document, or null if none
+// exists. `requireRegistered` (default false) controls what a MISSING document means:
+//  - false (every operational enforcement call site in index.ts) treats "not yet registered" as
+//    operational. This registry is still best-effort bookkeeping layered on top of
+//    cameraClaims/pairingState (the real sources of truth) -- a device that predates the registry,
+//    or whose lazy-migration write simply hasn't landed yet, must never be newly blocked because
+//    of that.
+//  - true (revokeRegisteredDevice's own "can't revoke what was never registered" check, handled
+//    separately in decideRevokeRegisteredDevice -- not routed through this function at all) is
+//    documented here only so DEVICE_NOT_REGISTERED's meaning is defined in exactly one place.
+export function checkRegisteredDeviceOperational(
+  existing: Pick<RegisteredDevice, "status" | "suspensionReason"> | null,
+  options: { requireRegistered?: boolean } = {}
+): DeviceOperationalDecision {
+  if (!existing) {
+    return options.requireRegistered ? { operational: false, reason: "DEVICE_NOT_REGISTERED" } : { operational: true };
+  }
+  if (existing.status === "revoked") {
+    return { operational: false, reason: "DEVICE_REVOKED" };
+  }
+  if (existing.status === "suspended") {
+    return {
+      operational: false,
+      reason: existing.suspensionReason === "plan" ? "DEVICE_SUSPENDED_PLAN" : "DEVICE_SUSPENDED",
+    };
+  }
+  return { operational: true };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan-based suspension: reconcileUserDeviceLimits
+// ---------------------------------------------------------------------------------------------
+// Brings a user's owned, non-revoked registeredDevices in line with their current plan limits,
+// independently per role (CAMERA/HOME each counted on their own) -- see
+// docs/DEVICE_REGISTRY.md's "Plan suspension" section for the full selection rule. Called from
+// reconcileDevicesOnEntitlementChange (index.ts) whenever maxCameras/maxHomeDevices actually
+// change; never itself reacts to subscriptionStatus (see entitlements.ts's
+// getPlanDeviceLimits/planDeviceLimitsFromEntitlementsData for why "blocked" must never reach
+// here as a limit change).
+
+// Deterministic tie-break: createdAt ascending, deviceId ascending on an exact tie -- never
+// lastSeenAt (that would make the active set drift every time a device happens to be used),
+// making a repeated reconcile with the same limit fully idempotent and its device selection
+// reproducible.
+function compareByCreatedAtThenDeviceId(a: RegisteredDevice, b: RegisteredDevice): number {
+  const aMillis = a.createdAt.toMillis();
+  const bMillis = b.createdAt.toMillis();
+  if (aMillis !== bMillis) return aMillis - bMillis;
+  if (a.deviceId < b.deviceId) return -1;
+  if (a.deviceId > b.deviceId) return 1;
+  return 0;
+}
+
+export interface DeviceLimitReconciliation {
+  toSuspendPlan: string[]; // deviceIds that should become status=suspended/suspensionReason=plan
+  toReactivate: string[]; // deviceIds that should become status=active/suspensionReason=null
+}
+
+// Pure: given ONE user's ONE role's already-fetched, non-revoked owned devices and that role's
+// limit, decides which deviceIds need a write.
+//
+// EVERY non-revoked device the caller passes in occupies a plan slot -- active, suspended/plan,
+// suspended/manual, and suspended/security all count toward `limit` (only `revoked` and
+// `ownerUid == null` devices, both already excluded by the caller's own query, are outside any
+// limit entirely). Sorted by createdAt ascending, deviceId ascending on an exact tie, the first
+// `limit` devices are "within plan"; the rest are "excess". Within that framing:
+//
+//  - `active`, within plan -> stays active (no-op).
+//  - `suspended`/`"plan"`, within plan -> reactivated to active.
+//  - `active`, excess -> suspended, reason "plan".
+//  - `suspended`/`"plan"`, excess -> stays suspended/plan (no-op).
+//  - `suspended`/`"manual"` or `suspended`/`"security"`, within plan OR excess -> **never
+//    touched**, either direction. A manual/security suspension still occupies (or, if excess,
+//    still vacates a would-be slot for) its position in the ordering -- it can push a later
+//    device into "excess" or free up a slot for an earlier one exactly like any other device
+//    would -- but its own status/suspensionReason is never the thing this function changes.
+//
+// A device already in its correct target state is never included in either output list, so a
+// caller applying these decisions never bumps `updatedAt` on a no-op.
+export function planDeviceLimitDecision(devices: RegisteredDevice[], limit: number): DeviceLimitReconciliation {
+  const sorted = [...devices].sort(compareByCreatedAtThenDeviceId);
+  const withinPlanIds = new Set(sorted.slice(0, Math.max(0, limit)).map((d) => d.deviceId));
+
+  const toSuspendPlan: string[] = [];
+  const toReactivate: string[] = [];
+
+  for (const device of sorted) {
+    if (device.status === "suspended" && (device.suspensionReason === "manual" || device.suspensionReason === "security")) {
+      continue;
+    }
+
+    const withinPlan = withinPlanIds.has(device.deviceId);
+    if (withinPlan && device.status === "suspended" && device.suspensionReason === "plan") {
+      toReactivate.push(device.deviceId);
+    } else if (!withinPlan && device.status === "active") {
+      toSuspendPlan.push(device.deviceId);
+    }
+  }
+
+  return { toSuspendPlan, toReactivate };
+}
+
+// Re-validates and applies ONE device's plan-limit state change inside its own small transaction
+// -- never trusts the plan-limit decision's input snapshot (from reconcileUserDeviceLimits' own
+// query, read before this runs) as still current. If the device's status has concurrently changed
+// to something this reconcile must never override (revoked, or a manual/security suspension that
+// landed after that query), the write is silently skipped: the device is left exactly as the
+// concurrent operation left it, never reverted back toward what this reconcile pass originally
+// computed. Returns whether a write actually happened, so the caller can log an accurate count.
+async function applyDevicePlanLimitChange(
+  db: admin.firestore.Firestore,
+  deviceId: string,
+  targetStatus: "active" | "suspended",
+  targetSuspensionReason: DeviceSuspensionReason
+): Promise<boolean> {
+  const ref = registeredDeviceRef(db, deviceId);
+
+  return db.runTransaction(async (t): Promise<boolean> => {
+    const snap = await t.get(ref);
+    if (!snap.exists) return false;
+
+    const existing = snap.data() as RegisteredDevice;
+    const stillEligible =
+      existing.status === "active" || (existing.status === "suspended" && existing.suspensionReason === "plan");
+    if (!stillEligible) return false;
+
+    if (existing.status === targetStatus && existing.suspensionReason === targetSuspensionReason) {
+      return false;
+    }
+
+    t.set(
+      ref,
+      {
+        status: targetStatus,
+        suspensionReason: targetSuspensionReason,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    return true;
+  });
+}
+
+// Applies planDeviceLimitDecision's selection for ONE role, one device at a time (never batched
+// into a single multi-document transaction/batch) -- see docs/DEVICE_REGISTRY.md's "Consistency
+// model" for why: a user's total owned-device count is expected to stay small (single digits to
+// low tens) in practice, so sequential per-device transactions keep the write ordering simple and
+// predictable without needing Firestore's 500-operation batch limit or a large multi-document
+// transaction that would contend with every other concurrent operation touching any of these
+// documents at once. Each device's own transaction independently re-validates it is still
+// eligible for an automatic plan-based change (see applyDevicePlanLimitChange above), so a
+// concurrent revoke or manual/security suspension landing on any ONE device mid-reconcile can
+// never be overridden by this pass, regardless of how many other devices it also touches.
+async function reconcileRoleDeviceLimit(
+  db: admin.firestore.Firestore,
+  devices: RegisteredDevice[],
+  limit: number
+): Promise<{ suspendedCount: number; reactivatedCount: number }> {
+  const { toSuspendPlan, toReactivate } = planDeviceLimitDecision(devices, limit);
+
+  let suspendedCount = 0;
+  for (const deviceId of toSuspendPlan) {
+    if (await applyDevicePlanLimitChange(db, deviceId, "suspended", "plan")) {
+      suspendedCount++;
+    }
+  }
+
+  let reactivatedCount = 0;
+  for (const deviceId of toReactivate) {
+    if (await applyDevicePlanLimitChange(db, deviceId, "active", null)) {
+      reactivatedCount++;
+    }
+  }
+
+  return { suspendedCount, reactivatedCount };
+}
+
+// Reconciles one user's CAMERA and HOME device counts (independently) against `limits`. Reads
+// every registeredDevices document with ownerUid == ownerUid via a single-field query (a device
+// with ownerUid == null never belongs to any user's limit, and is excluded by this query by
+// construction) -- role and revoked-status filtering happen in memory afterward, deliberately
+// avoiding a multi-field composite query that would require a new Firestore index this project
+// does not otherwise need. Never throws for an individual device's own transaction failing to
+// apply (Firestore's own transaction retry already handles ordinary contention); a genuine,
+// repeated failure surfaces as that device simply not being included in the returned count, safe
+// to retry on the next entitlement change or a future explicit reconcile trigger.
+export async function reconcileUserDeviceLimits(
+  db: admin.firestore.Firestore,
+  ownerUid: string,
+  limits: DeviceLimits
+): Promise<{
+  camerasSuspended: number;
+  camerasReactivated: number;
+  homeDevicesSuspended: number;
+  homeDevicesReactivated: number;
+}> {
+  const snap = await db.collection(REGISTERED_DEVICES_COLLECTION).where("ownerUid", "==", ownerUid).get();
+  const all = snap.docs.map((d) => d.data() as RegisteredDevice);
+
+  const cameras = all.filter((d) => d.role === "CAMERA" && d.status !== "revoked");
+  const homes = all.filter((d) => d.role === "HOME" && d.status !== "revoked");
+
+  const [cameraResult, homeResult] = await Promise.all([
+    reconcileRoleDeviceLimit(db, cameras, limits.maxCameras),
+    reconcileRoleDeviceLimit(db, homes, limits.maxHomeDevices),
+  ]);
+
+  logger.info("DEVICE_REGISTRY_RECONCILE_USER_LIMITS", {
+    operation: "plan_reconcile",
+    camerasSuspended: cameraResult.suspendedCount,
+    camerasReactivated: cameraResult.reactivatedCount,
+    homeDevicesSuspended: homeResult.suspendedCount,
+    homeDevicesReactivated: homeResult.reactivatedCount,
+  });
+
+  return {
+    camerasSuspended: cameraResult.suspendedCount,
+    camerasReactivated: cameraResult.reactivatedCount,
+    homeDevicesSuspended: homeResult.suspendedCount,
+    homeDevicesReactivated: homeResult.reactivatedCount,
+  };
 }

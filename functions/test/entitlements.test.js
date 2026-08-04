@@ -7,6 +7,8 @@ const {
   getEffectiveUserEntitlements,
   getTurnCredentials,
   isUserEntitlementsExpired,
+  getPlanDeviceLimits,
+  planDeviceLimitsFromEntitlementsData,
 } = require("../lib/index.js");
 const admin = require("firebase-admin");
 
@@ -453,4 +455,103 @@ test("logs: corrupt entitlements document warning never leaks raw document field
   assert.ok(output.includes("INVALID_PLAN"), "the fixed corruption-reason enum value should be logged");
   assert.ok(!output.includes(suspiciousValue), "raw corrupt field values must never be logged");
   assert.ok(!output.includes(uid), "the uid must never appear in the corrupt-document warning either");
+});
+
+// =================================================================================================
+// getPlanDeviceLimits / planDeviceLimitsFromEntitlementsData -- plan device limits, deliberately
+// NOT zeroed for subscriptionStatus == "blocked" (unlike getEffectiveUserEntitlements). See
+// deviceRegistry.ts's reconcileUserDeviceLimits, which is the only consumer of these limits.
+// =================================================================================================
+
+test("getPlanDeviceLimits: no document returns Free limits (1/1)", async () => {
+  const result = await getPlanDeviceLimits("uid-device-limits-no-doc", db);
+  assert.deepEqual(result, { maxCameras: 1, maxHomeDevices: 1 });
+});
+
+test("getPlanDeviceLimits: 24. subscriptionStatus == 'blocked' does NOT zero out the plan's device limits", async () => {
+  const uid = "uid-device-limits-blocked";
+  await entitlementsRef(uid).set(validDoc({ subscriptionStatus: "blocked", maxCameras: 5, maxHomeDevices: 3 }));
+
+  const result = await getPlanDeviceLimits(uid, db);
+
+  assert.deepEqual(result, { maxCameras: 5, maxHomeDevices: 3 }, "blocked must not affect plan device limits");
+  // Contrast with getEffectiveUserEntitlements, which DOES zero these out for operational access --
+  // proves the two helpers are deliberately different, not that one of them is wrong.
+  const effective = await getEffectiveUserEntitlements(uid, db);
+  assert.equal(effective.maxCameras, 0);
+  assert.equal(effective.turnAccessAllowed, false);
+});
+
+test("getPlanDeviceLimits: an expired grant falls back to Free limits (unlike blocked, expiry is a real downgrade)", async () => {
+  const uid = "uid-device-limits-expired";
+  await entitlementsRef(uid).set(validDoc({ subscriptionStatus: "expired", maxCameras: 5, maxHomeDevices: 3 }));
+
+  const result = await getPlanDeviceLimits(uid, db);
+
+  assert.deepEqual(result, { maxCameras: 1, maxHomeDevices: 1 });
+});
+
+test("getPlanDeviceLimits: a corrupt document falls back to Free limits", async () => {
+  const uid = "uid-device-limits-corrupt";
+  await entitlementsRef(uid).set(validDoc({ plan: "not-a-real-plan", maxCameras: 9, maxHomeDevices: 9 }));
+
+  const result = await getPlanDeviceLimits(uid, db);
+
+  assert.deepEqual(result, { maxCameras: 1, maxHomeDevices: 1 });
+});
+
+test("getPlanDeviceLimits: active premium returns the stored limits verbatim", async () => {
+  const uid = "uid-device-limits-active";
+  await entitlementsRef(uid).set(validDoc({ maxCameras: 5, maxHomeDevices: 5 }));
+
+  const result = await getPlanDeviceLimits(uid, db);
+
+  assert.deepEqual(result, { maxCameras: 5, maxHomeDevices: 5 });
+});
+
+// --- planDeviceLimitsFromEntitlementsData: pure function (no Firestore read) ---------------------
+
+test("planDeviceLimitsFromEntitlementsData: undefined data (25. document deleted) returns Free limits", () => {
+  assert.deepEqual(planDeviceLimitsFromEntitlementsData(undefined), { maxCameras: 1, maxHomeDevices: 1 });
+});
+
+test("planDeviceLimitsFromEntitlementsData: 24. changing only subscriptionStatus (active -> blocked) leaves limits unchanged", () => {
+  const now = admin.firestore.Timestamp.now();
+  const base = {
+    schemaVersion: 1,
+    plan: "premium",
+    maxCameras: 5,
+    maxHomeDevices: 5,
+    maxConcurrentLiveSessions: 2,
+    turnAccessAllowed: true,
+    source: "manual",
+    validUntil: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const before = planDeviceLimitsFromEntitlementsData({ ...base, subscriptionStatus: "active" });
+  const after = planDeviceLimitsFromEntitlementsData({ ...base, subscriptionStatus: "blocked" });
+
+  assert.deepEqual(before, after, "a subscriptionStatus-only change must never look like a limit change");
+});
+
+test("planDeviceLimitsFromEntitlementsData: a real maxCameras/maxHomeDevices change is reflected", () => {
+  const now = admin.firestore.Timestamp.now();
+  const base = {
+    schemaVersion: 1,
+    plan: "premium",
+    subscriptionStatus: "active",
+    maxConcurrentLiveSessions: 2,
+    turnAccessAllowed: true,
+    source: "manual",
+    validUntil: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const before = planDeviceLimitsFromEntitlementsData({ ...base, maxCameras: 1, maxHomeDevices: 1 });
+  const after = planDeviceLimitsFromEntitlementsData({ ...base, maxCameras: 5, maxHomeDevices: 5 });
+
+  assert.notDeepEqual(before, after);
 });
