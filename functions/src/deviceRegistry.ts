@@ -41,6 +41,15 @@ export interface RegisteredDevice {
   updatedAt: admin.firestore.Timestamp;
   lastSeenAt: admin.firestore.Timestamp;
   revokedAt: admin.firestore.Timestamp | null;
+  // Set only once a device's device-proof (Keystore-signed challenge) has been successfully
+  // verified at least once -- see deviceChallenges.ts's consumeVerifiedTurnCredentialsChallenge.
+  // Absent (undefined at runtime, despite this non-optional type -- matching every other field's
+  // existing "as RegisteredDevice" cast looseness in this file) on every document created before
+  // this stage, and on any document that has never yet completed a verified proof. Never set by
+  // registerLegacyCamera/registerLegacyHome/attachCameraOwner/detachCameraOwner/
+  // touchRegisteredDevice/applyPublicKeyRegistration/applyCameraPublicKeyRegistration -- this
+  // field is purely informational at this stage, not yet consulted by any enforcement decision.
+  deviceProofVersion: number | null;
 }
 
 const REGISTERED_DEVICES_COLLECTION = "registeredDevices";

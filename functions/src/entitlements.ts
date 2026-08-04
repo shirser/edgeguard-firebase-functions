@@ -249,6 +249,41 @@ async function resolveStoredOrFreeEntitlements(
   return resolveEntitlementsData(snap.exists ? snap.data() : undefined);
 }
 
+// Pure variant of getEffectiveUserEntitlements for a caller that already has a raw
+// userEntitlements document's data() in hand (or undefined for "no document") and must not
+// perform a fresh, non-transactional Firestore read -- e.g. a Firestore transaction that already
+// read this document via transaction.get() as part of its own atomic read set (see
+// deviceChallenges.ts's consumeVerifiedTurnCredentialsChallenge, which must check
+// turnAccessAllowed atomically alongside challenge/registry/claim state, never via a second,
+// separately-timed read outside the transaction). Shares the exact same resolution/blocked-zeroing
+// rules as getEffectiveUserEntitlements below (which is now defined in terms of this function) --
+// never a second, divergent copy of that logic.
+export function effectiveUserEntitlementsFromData(
+  data: FirebaseFirestore.DocumentData | undefined
+): EffectiveUserEntitlements {
+  const resolved = resolveEntitlementsData(data);
+
+  if (resolved.subscriptionStatus === "blocked") {
+    return {
+      plan: resolved.plan,
+      subscriptionStatus: "blocked",
+      maxCameras: 0,
+      maxHomeDevices: 0,
+      maxConcurrentLiveSessions: 0,
+      turnAccessAllowed: false,
+    };
+  }
+
+  return {
+    plan: resolved.plan,
+    subscriptionStatus: resolved.subscriptionStatus,
+    maxCameras: resolved.maxCameras,
+    maxHomeDevices: resolved.maxHomeDevices,
+    maxConcurrentLiveSessions: resolved.maxConcurrentLiveSessions,
+    turnAccessAllowed: resolved.turnAccessAllowed,
+  };
+}
+
 // Reads userEntitlements/{uid} and returns the already-safe effective
 // rights this uid actually has right now:
 //  - No document at all -> Free defaults. Never creates the document as a
@@ -276,27 +311,8 @@ export async function getEffectiveUserEntitlements(
   uid: string,
   db: admin.firestore.Firestore = admin.firestore()
 ): Promise<EffectiveUserEntitlements> {
-  const resolved = await resolveStoredOrFreeEntitlements(uid, db);
-
-  if (resolved.subscriptionStatus === "blocked") {
-    return {
-      plan: resolved.plan,
-      subscriptionStatus: "blocked",
-      maxCameras: 0,
-      maxHomeDevices: 0,
-      maxConcurrentLiveSessions: 0,
-      turnAccessAllowed: false,
-    };
-  }
-
-  return {
-    plan: resolved.plan,
-    subscriptionStatus: resolved.subscriptionStatus,
-    maxCameras: resolved.maxCameras,
-    maxHomeDevices: resolved.maxHomeDevices,
-    maxConcurrentLiveSessions: resolved.maxConcurrentLiveSessions,
-    turnAccessAllowed: resolved.turnAccessAllowed,
-  };
+  const snap = await db.collection("userEntitlements").doc(uid).get();
+  return effectiveUserEntitlementsFromData(snap.exists ? snap.data() : undefined);
 }
 
 // The device-count limits (only) a user's plan actually entitles them to -- for device registry

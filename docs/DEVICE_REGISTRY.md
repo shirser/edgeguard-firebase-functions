@@ -564,6 +564,132 @@ logged: the raw `publicKey`, the raw DER bytes, `request.auth.uid`, `ownerUid`, 
 full request body, or the full Firestore document. On an invalid key, `publicKeyFingerprint` is
 simply absent (the DER couldn't be safely decoded to fingerprint in the first place).
 
+## Device-signature challenge protocol: `createDeviceChallenge` + verified `getTurnCredentials`
+
+Implemented in `functions/src/deviceChallenges.ts`. Lets a device that has already completed
+`registerDevicePublicKey` (`identityMode: "keystore"`) prove, per-request, that it still holds the
+matching Keystore private key — closing the gap the previous section calls out ("registering a key
+is not the same as proving possession of it on every request"). **`getTurnCredentials` is the
+first, and so far only, endpoint that accepts this proof.**
+
+### `createDeviceChallenge`
+
+A callable (region `europe-west1`) that issues a `deviceChallenges/{challengeId}` document for the
+single supported purpose today, `TURN_CREDENTIALS`. Request: `{ deviceId, purpose, requestPayload:
+{ cameraDeviceId, turnPurpose } }` — `role`/`authUid` are never accepted from the client (`role`
+comes from `registeredDevices/{deviceId}.role`, `authUid` from `request.auth.uid`). Response:
+`{ challengeId, nonce, purpose, expiresAt, canonicalPayload }`. Requires the calling device to
+already be `identityMode: "keystore"`, operational, and linked to the target Camera (same
+`cameraClaims`/entitlement checks `getTurnCredentials` itself performs). TTL is 90 seconds. See
+`createDeviceChallenge`'s own doc comment in `index.ts` for the full eligibility sequence — this
+stage does not accept or verify a signature at all; it only issues the challenge.
+
+### Canonical formats
+
+Two fixed, versioned, LF-joined, UTF-8, never-`JSON.stringify()`d formats — the same on the backend
+(TypeScript) and both Android apps (Kotlin `HomeDeviceProofSigner`/`CameraDeviceProofSigner`):
+
+```
+EDGEGUARD_REQUEST_V1
+purpose=TURN_CREDENTIALS
+cameraDeviceId=<cameraDeviceId>
+turnPurpose=<turnPurpose>
+```
+
+hashed (`sha256`, lowercase hex) into `requestHash`, and
+
+```
+EDGEGUARD_DEVICE_PROOF_V1
+challengeId=<challengeId>
+deviceId=<deviceId>
+role=<HOME|CAMERA>
+purpose=TURN_CREDENTIALS
+authUid=<authUid>
+nonce=<nonce>
+requestHash=<requestHash>
+expiresAt=<epochMillis>
+```
+
+which is the exact byte string a device signs (`SHA256withECDSA` → ASN.1 DER → standard, non-URL-
+safe Base64, `Base64.NO_WRAP` on Android). Verified server-side via `crypto.verify("sha256", ...)`
+against `registeredDevices/{deviceId}.publicKey` (SPKI DER, standard Base64) — **never** a
+client-supplied public key, and **never** a client-supplied `canonicalPayload`: the server always
+rebuilds both canonical strings itself, entirely from already-verified, freshly-read Firestore
+state, inside the same transaction that checks the signature.
+
+### Verified `getTurnCredentials`
+
+`getTurnCredentials`'s request may optionally include:
+
+```typescript
+{
+  cameraDeviceId: string;
+  purpose: "LIVE_VIEW" | "PLACEMENT_PREVIEW" | "ACTIVITY_ZONE" | "ENTRY_EXIT_LINE" | "MEDIA_TRANSFER";
+  deviceProof?: { protocolVersion: 1; challengeId: string; signature: string };
+}
+```
+
+**Optional, not required by `identityMode` or `deviceProofVersion` at this stage.** `deviceProof`
+entirely absent → the pre-existing `cameraClaims`/`assertRegisteredDeviceOperational`/
+`turnAccessAllowed` flow runs completely unchanged — old clients are unaffected. `deviceProof`
+present (including an explicit `null`, which is malformed, not "absent") → the whole call is
+authorized by `consumeVerifiedTurnCredentialsChallenge()` instead, and **any failure denies the
+call outright — there is no fallback to the old flow once a client attempts a proof.**
+
+`consumeVerifiedTurnCredentialsChallenge()` runs entirely inside **one** Firestore transaction —
+verify and consume are never split into a separate check followed by a separate update, the same
+"claim + registry read together" atomicity `applyCameraPublicKeyRegistration()` already established
+for `registerDevicePublicKey`. Inside that one transaction it reads and re-checks, fresh (never
+trusting challenge-creation-time state): `deviceChallenges/{challengeId}` (schema, challenge-id/
+purpose/authUid match, unused, unexpired, well-formed nonce/requestHash/role), `registeredDevices/
+{challenge.deviceId}` (exists, role/authUid match, `identityMode: "keystore"`, `publicKey` present,
+operational), a **recomputed** `requestHash` from the actual request just received (catches a
+`cameraDeviceId`/`turnPurpose` changed after the challenge was issued), `cameraClaims/
+{cameraDeviceId}` (HOME: `uid == authUid`; CAMERA: `deviceId == cameraDeviceId` and
+`cameraAuthUid == authUid`), the target Camera's own `registeredDevices` document (operational —
+permissive on a missing document, exactly like the existing non-proof path), and `userEntitlements/
+{ownerUid}` (`turnAccessAllowed`, via the same pure resolution `getEffectiveUserEntitlements` itself
+uses — `entitlements.ts`'s `effectiveUserEntitlementsFromData`, never a second copy of that logic).
+Signature verification is the last, most expensive check, exactly in that order.
+
+**Errors are deliberately coarse.** Distinguishable, already-safe business states keep their own
+message (`CHALLENGE_NOT_FOUND`, `CHALLENGE_EXPIRED`, `CHALLENGE_ALREADY_USED`,
+`DEVICE_NOT_PROVISIONED`, `DEVICE_IDENTITY_CORRUPT`, `DEVICE_SUSPENDED[_PLAN]`, `DEVICE_REVOKED`,
+`TURN_ACCESS_DENIED`) — but every reason that could function as a signature/authorization oracle
+(challenge id/purpose/authUid/schema mismatch, role mismatch, request-hash-after-tampering
+mismatch, camera-target mismatch, camera claim/access denial, and an invalid signature itself)
+collapses to one generic `permission-denied`/`DEVICE_PROOF_DENIED`, so a caller can never use the
+response to tell "almost a valid signature" apart from "wrong challenge" or "wrong camera".
+
+### Replay protection
+
+A challenge can be consumed at most once: `usedAt`/`usedByFunction` are set only inside the same
+transaction that verified everything else, so two concurrent consumption attempts for the same
+challenge are serialized by Firestore's own transaction contention/retry — exactly one succeeds,
+the other sees `usedAt != null` and is denied, never a silent double-apply (mirrors
+`registerDevicePublicKey`'s own proven "two concurrent first-key requests" guarantee). A second
+call reusing the same signature — for the same camera or a different one — is rejected the same
+way. An **invalid** proof never marks the challenge used and never touches `deviceProofVersion` —
+only a fully verified signature writes anything at all.
+
+### `deviceProofVersion`
+
+`registeredDevices/{deviceId}.deviceProofVersion` (`number | null`) is set to `1` only once, only
+on the **signing** device's own document, only after its very first successfully verified device
+proof — merged (`role`/`authUid`/`ownerUid`/`status`/`publicKey`/`identityMode` untouched), and
+never lowered if a future version is ever stored higher. **Purely informational at this stage — not
+yet consulted by any enforcement decision, and not set by `registerDevicePublicKey` or any other
+existing lazy-migration path.** It exists so a future rollout stage can require a proof based on
+"this device has already completed one successfully" without needing a bulk backfill.
+
+### Rollout
+
+Exactly one stage implemented so far: `deviceProof` accepted and, when present, fully enforced;
+absent, the old flow is untouched. **Proof is not required by `identityMode` or
+`deviceProofVersion` in this stage** — requiring it would break every Home/Camera app build that
+predates this feature. A future stage may progressively require it (mirroring how `identityMode:
+"keystore"` itself was rolled out) — not implemented here.
+
 ## Identity is never overwritten
 
 If a `registeredDevices/{deviceId}` document already exists, none of the operations below will
@@ -652,11 +778,13 @@ way.
   effective entitlements" above).
 
 **Not enforced / explicitly out of scope:**
-- **Signature verification of any request** — a registered public key is not yet used to verify
-  anything on subsequent calls (no challenge, no proof-of-possession check). Both Camera and Home
-  remain authenticated only by their Firebase Auth uid (Camera's cryptographically anchored via
-  `cameraClaims.cameraAuthUid`; Home's not per-device-distinguishable at all — see "Camera vs. Home
-  status enforcement" above).
+- **Signature verification of any request except `getTurnCredentials`, and only when the caller
+  opts in** — `getTurnCredentials` optionally accepts and fully verifies a Keystore-signed
+  `deviceProof` (see "Device-signature challenge protocol" above), but proof is not required by
+  `identityMode` or `deviceProofVersion` at this stage, and no other callable accepts one yet. Both
+  Camera and Home otherwise remain authenticated only by their Firebase Auth uid (Camera's
+  cryptographically anchored via `cameraClaims.cameraAuthUid`; Home's not per-device-distinguishable
+  at all — see "Camera vs. Home status enforcement" above).
 - **Per-device Home enforcement** — `registeredDevices.status` for a `HOME` device is correctly
   representable (including `revoked`, via `revokeRegisteredDevice`) but nothing server-side today
   denies an operation to one specific Home installation based on it. This is the single biggest

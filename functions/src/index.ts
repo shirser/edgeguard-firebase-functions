@@ -31,8 +31,14 @@ import {
   checkDeviceChallengeEligibility,
   buildDeviceChallengeDocument,
   CHALLENGE_TTL_SECONDS,
+  validateTurnCredentialsDeviceProof,
+  consumeVerifiedTurnCredentialsChallenge,
 } from "./deviceChallenges";
-import type { DeviceChallengePurpose } from "./deviceChallenges";
+import type {
+  DeviceChallengePurpose,
+  TurnChallengePurpose,
+  TurnCredentialsChallengeVerificationFailureReason,
+} from "./deviceChallenges";
 
 admin.initializeApp();
 
@@ -106,6 +112,13 @@ export {
   CHALLENGE_TTL_SECONDS,
   DEVICE_CHALLENGE_SCHEMA_VERSION,
   DEVICE_PROOF_MAX_BYTES,
+  DEVICE_PROOF_SUPPORTED_PROTOCOL_VERSION,
+  DEVICE_PROOF_SIGNATURE_MAX_BYTES,
+  DEVICE_PROOF_VERSION,
+  validateDeviceProofSignatureBase64,
+  validateTurnCredentialsDeviceProof,
+  verifyDeviceProofSignature,
+  consumeVerifiedTurnCredentialsChallenge,
 } from "./deviceChallenges";
 export type {
   DeviceChallengePurpose,
@@ -117,7 +130,15 @@ export type {
   DeviceChallengeEligibilityDecision,
   CanonicalDeviceProofFields,
   DeviceChallengeDocument,
+  TurnCredentialsDeviceProof,
+  DeviceProofInvalidReason,
+  TurnCredentialsDeviceProofValidation,
+  SignatureInvalidReason,
+  SignatureBase64Validation,
+  TurnCredentialsChallengeVerificationFailureReason,
+  TurnCredentialsChallengeConsumptionOutcome,
 } from "./deviceChallenges";
+export { effectiveUserEntitlementsFromData } from "./entitlements";
 
 function hashSecret(secret: string): string {
   return crypto.createHash("sha256").update(secret).digest("hex");
@@ -1219,6 +1240,52 @@ export async function getVerifiedCameraClaim(
 // WebRTC session purposes used elsewhere in this project's signaling schema,
 // but does not otherwise change the credentials issued -- it exists so
 // access requests are self-describing in logs/audits.
+//
+// Optionally accepts a `deviceProof` field (see deviceChallenges.ts) -- when present, the whole
+// call is authorized by a verified Keystore signature instead of (or in addition to, for the
+// registry-bookkeeping side effects) the plain cameraClaims/entitlements checks below. See the
+// callable's own body for the exact branch; when `deviceProof` is entirely absent, behavior is
+// byte-for-byte identical to before this was added.
+
+// Every TurnCredentialsChallengeVerificationFailureReason mapped to a deliberately narrow set of
+// public (code, message) pairs -- see deviceChallenges.ts's own doc on
+// TurnCredentialsChallengeVerificationFailureReason for why. Distinguishable, already-safe
+// business states (not found / expired / already used / not provisioned / identity corrupt /
+// device status / TURN access) keep their own specific message, reusing the exact same strings
+// this project already surfaces elsewhere (DEVICE_NOT_PROVISIONED, DEVICE_IDENTITY_CORRUPT,
+// DEVICE_SUSPENDED[..._PLAN], DEVICE_REVOKED, TURN_ACCESS_DENIED) for consistency. Every reason
+// that could function as a signature/authorization oracle (challenge id/purpose/authUid/schema/
+// nonce/requestHash format, role mismatch, request-hash-after-tampering mismatch, camera target
+// mismatch, camera claim/access denial, and the signature itself) collapses to one generic
+// permission-denied/DEVICE_PROOF_DENIED -- a caller can never use the response to tell "almost a
+// valid signature" apart from "wrong challenge" or "wrong camera".
+function mapTurnCredentialsChallengeDenialToHttpsError(
+  reason: TurnCredentialsChallengeVerificationFailureReason
+): HttpsError {
+  switch (reason) {
+    case "CHALLENGE_NOT_FOUND":
+      return new HttpsError("not-found", "CHALLENGE_NOT_FOUND");
+    case "REQUESTING_DEVICE_NOT_REGISTERED":
+      return new HttpsError("not-found", "DEVICE_NOT_REGISTERED");
+    case "CHALLENGE_EXPIRED":
+      return new HttpsError("failed-precondition", "CHALLENGE_EXPIRED");
+    case "CHALLENGE_ALREADY_USED":
+      return new HttpsError("failed-precondition", "CHALLENGE_ALREADY_USED");
+    case "REQUESTING_DEVICE_NOT_PROVISIONED":
+      return new HttpsError("failed-precondition", "DEVICE_NOT_PROVISIONED");
+    case "REQUESTING_DEVICE_IDENTITY_CORRUPT":
+      return new HttpsError("failed-precondition", "DEVICE_IDENTITY_CORRUPT");
+    case "DEVICE_SUSPENDED":
+    case "DEVICE_SUSPENDED_PLAN":
+    case "DEVICE_REVOKED":
+      return new HttpsError("permission-denied", reason);
+    case "TURN_ACCESS_DENIED":
+      return new HttpsError("permission-denied", "TURN_ACCESS_DENIED");
+    default:
+      return new HttpsError("permission-denied", "DEVICE_PROOF_DENIED");
+  }
+}
+
 export const getTurnCredentials = onCall(
   { region: "europe-west1", secrets: [turnRestSecret] },
   async (request) => {
@@ -1227,9 +1294,10 @@ export const getTurnCredentials = onCall(
     }
 
     const uid = request.auth.uid;
-    const { cameraDeviceId, purpose } = request.data as {
+    const { cameraDeviceId, purpose, deviceProof } = request.data as {
       cameraDeviceId?: string;
       purpose?: string;
+      deviceProof?: unknown;
     };
 
     if (typeof cameraDeviceId !== "string" || cameraDeviceId.length === 0) {
@@ -1239,10 +1307,91 @@ export const getTurnCredentials = onCall(
     if (!isValidTurnPurpose(purpose)) {
       throw new HttpsError("invalid-argument", "INVALID_PURPOSE");
     }
+    // isValidTurnPurpose returns a plain boolean (not a type predicate) so as not to change its
+    // existing signature/behavior -- this cast is safe only because the check just above already
+    // confirmed, at runtime, that `purpose` is one of the same 5 values TurnChallengePurpose
+    // names.
+    const turnPurpose = purpose as TurnChallengePurpose;
 
     logger.info("GET_TURN_CREDENTIALS_START", { uid, cameraDeviceId, purpose });
 
     const db = admin.firestore();
+
+    // Optional device-proof path (see deviceChallenges.ts). A request that omits `deviceProof`
+    // entirely falls straight through to the exact, unmodified pre-existing flow below -- old
+    // clients are completely unaffected. A request that INCLUDES the field -- even an explicit
+    // `null`, which is a malformed attempt, not "absent" -- must fully verify, or the call is
+    // denied outright; there is no fallback to the old flow once a client attempts a proof.
+    const hasDeviceProofField =
+      request.data !== null && typeof request.data === "object" && "deviceProof" in request.data;
+
+    if (hasDeviceProofField) {
+      const proofValidation = validateTurnCredentialsDeviceProof(deviceProof);
+      if (!proofValidation.valid) {
+        logger.info("TURN_DEVICE_PROOF_VERIFY_DENIED", {
+          cameraDeviceId,
+          turnPurpose: purpose,
+          reason: proofValidation.reason,
+        });
+        throw new HttpsError("invalid-argument", "INVALID_DEVICE_PROOF");
+      }
+      const proof = proofValidation.proof;
+
+      logger.info("TURN_DEVICE_PROOF_VERIFY_START", {
+        challengeId: proof.challengeId,
+        cameraDeviceId,
+        turnPurpose: purpose,
+        protocolVersion: proof.protocolVersion,
+      });
+
+      const consumption = await consumeVerifiedTurnCredentialsChallenge(db, {
+        requestAuthUid: uid,
+        cameraDeviceId,
+        turnPurpose,
+        deviceProof: proof,
+        nowMillis: Date.now(),
+      });
+
+      if (consumption.outcome !== "verified") {
+        logger.info("TURN_DEVICE_PROOF_VERIFY_DENIED", {
+          challengeId: proof.challengeId,
+          cameraDeviceId,
+          turnPurpose: purpose,
+          reason: consumption.reason,
+        });
+        throw mapTurnCredentialsChallengeDenialToHttpsError(consumption.reason);
+      }
+
+      logger.info("TURN_DEVICE_PROOF_VERIFY_SUCCESS", {
+        challengeId: proof.challengeId,
+        deviceId: consumption.deviceId,
+        role: consumption.role,
+        cameraDeviceId,
+        turnPurpose: purpose,
+      });
+
+      // Best-effort device-registry lazy migration -- same call, same non-blocking semantics, as
+      // the existing flow below; cameraAuthUid/ownerUid come from the SAME cameraClaims read the
+      // transaction above already performed, never a second, separately-timed read.
+      await attachCameraOwner(db, cameraDeviceId, consumption.cameraAuthUid, consumption.ownerUid);
+
+      let proofResponse;
+      try {
+        proofResponse = buildTurnCredentialsResponse(turnRestSecret.value(), uid);
+      } catch (error) {
+        logger.error("GET_TURN_CREDENTIALS_MISSING_SECRET", { uid, cameraDeviceId, purpose });
+        throw error;
+      }
+
+      logger.info("GET_TURN_CREDENTIALS_SUCCESS", { uid, cameraDeviceId, purpose });
+
+      return proofResponse;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Existing flow, byte-for-byte unchanged -- reached only when `deviceProof` is entirely
+    // absent from the request. See this function's own top-level doc.
+    // ---------------------------------------------------------------------------------------
     const claim = await getVerifiedCameraClaim(db, cameraDeviceId, uid);
 
     if (claim.access === "not-found") {
