@@ -257,18 +257,38 @@ test.afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// 1: backward compatibility
+// 1: backward compatibility -- Camera legacy path preserved, Home path now fail-closed
 // ---------------------------------------------------------------------------------------------
+// Home no longer has a working unsigned path (see index.ts's getTurnCredentials, "Fail-closed for
+// HOME"): a request without deviceProof from the linked Home owner (cameraClaims.uid) is now
+// rejected outright. Camera does not yet send a deviceProof (edgeguard-camera-android's
+// TurnCredentialsProvider only ever sends {cameraDeviceId, purpose}), so its own unsigned path
+// (cameraClaims.cameraAuthUid) is deliberately left reachable, unchanged.
 
-test("getTurnCredentials: a request without deviceProof at all keeps working exactly as before", async () => {
+test("getTurnCredentials: a request without deviceProof at all still works for the Camera legacy path", async () => {
   process.env.TURN_REST_SECRET = "dp-compat-secret";
   const cameraDeviceId = uniqueId("dp-compat-camera");
   const ownerUid = uniqueId("dp-compat-owner");
-  await claimRef(cameraDeviceId).set({ uid: ownerUid, cameraAuthUid: "dp-compat-camera-auth" });
+  const cameraAuthUid = "dp-compat-camera-auth";
+  await claimRef(cameraDeviceId).set({ uid: ownerUid, cameraAuthUid });
 
-  const response = await getTurnCredentials.run(fakeRequest({ cameraDeviceId, purpose: TURN_PURPOSE }, ownerUid));
+  const response = await getTurnCredentials.run(fakeRequest({ cameraDeviceId, purpose: TURN_PURPOSE }, cameraAuthUid));
 
   assert.equal(response.iceServers.length, 1);
+  await claimRef(cameraDeviceId).delete();
+});
+
+test("getTurnCredentials: a request without deviceProof at all from the linked Home owner is now rejected (fail-closed)", async () => {
+  process.env.TURN_REST_SECRET = "dp-compat-secret-2";
+  const cameraDeviceId = uniqueId("dp-compat-camera-2");
+  const ownerUid = uniqueId("dp-compat-owner-2");
+  await claimRef(cameraDeviceId).set({ uid: ownerUid, cameraAuthUid: "dp-compat-camera-auth-2" });
+
+  await assert.rejects(
+    getTurnCredentials.run(fakeRequest({ cameraDeviceId, purpose: TURN_PURPOSE }, ownerUid)),
+    (err) => err.code === "failed-precondition" && err.message === "DEVICE_PROOF_REQUIRED"
+  );
+
   await claimRef(cameraDeviceId).delete();
 });
 
@@ -753,7 +773,7 @@ test("getTurnCredentials: a signature made with a different P-256 key is rejecte
 // 28-34: successful verification and its side effects
 // ---------------------------------------------------------------------------------------------
 
-test("getTurnCredentials: a valid HOME proof issues TURN credentials", async () => {
+test("getTurnCredentials: a valid HOME proof issues TURN credentials with the existing, unchanged response schema", async () => {
   process.env.TURN_REST_SECRET = "dp-home-success-secret";
   const setup = await setupValidHomeScenario();
 
@@ -761,7 +781,23 @@ test("getTurnCredentials: a valid HOME proof issues TURN credentials", async () 
     fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
   );
 
+  // Same schema turn-credentials.test.js's own Camera-legacy-path test asserts -- proves the
+  // deviceProof-verified issuance path returns byte-for-byte the same response shape as the
+  // pre-existing, unsigned buildTurnCredentialsResponse() path (they're literally the same
+  // function call -- see index.ts).
   assert.equal(response.iceServers.length, 1);
+  assert.deepEqual(response.iceServers[0].urls, [
+    "stun:turn.edgeguard.cc:3478",
+    "turn:turn.edgeguard.cc:3478?transport=udp",
+    "turn:turn.edgeguard.cc:3478?transport=tcp",
+    "turns:turn.edgeguard.cc:5349?transport=tcp",
+  ]);
+  assert.match(response.iceServers[0].username, new RegExp(`^\\d+:${setup.homeUid}$`));
+  assert.equal(
+    response.iceServers[0].credential,
+    crypto.createHmac("sha1", "dp-home-success-secret").update(response.iceServers[0].username).digest("base64")
+  );
+  assert.equal(typeof response.expiresAt, "number");
   await setup.cleanup();
 });
 
@@ -969,6 +1005,56 @@ test("getTurnCredentials: public key, signature, canonical payload, and nonce ne
     !output.includes(publicKeySpkiBase64(setup.cameraKeyPair.publicKey)),
     "public key must never be logged"
   );
+
+  await setup.cleanup();
+});
+
+// ---------------------------------------------------------------------------------------------
+// Regression: proof verifier / credential issuer call counts.
+// ---------------------------------------------------------------------------------------------
+// Adapted to this repo's emulator-integration test style (node:test against a real Firestore
+// emulator, no mocked seams to literally count calls on -- see this task's own "adapt the first
+// count to the existing architecture" instruction). Each count is proxied through an observable
+// side effect instead:
+//   - unsigned Home request -> rejected before the deviceProof branch is even entered
+//     (hasDeviceProofField is false) -- verifier calls = 0, issuer calls = 0. See
+//     turn-credentials.test.js's own "performs no registry write and never reaches credential
+//     issuance" test (proxied there via a deleted TURN_REST_SECRET still producing
+//     DEVICE_PROOF_REQUIRED, never "internal").
+//   - invalid signed Home request -> the verifier runs (and denies) -- verifier calls = 1; the
+//     issuer is never reached -- issuer calls = 0. Proxied below the same way: TURN_REST_SECRET is
+//     deleted, so if buildTurnCredentialsResponse (the issuer) were ever reached it would throw
+//     "internal" instead of the expected DEVICE_PROOF_DENIED, and the challenge would end up
+//     consumed if the verifier ran a second time.
+//   - valid signed Home request -> the verifier runs once (consumes/marks the challenge used) and
+//     the issuer runs exactly once (a real TURN response is returned) -- see "a valid HOME proof
+//     issues TURN credentials with the existing, unchanged response schema" above, and "reusing
+//     the same signature a second time is rejected" for the verifier's own single-use guarantee.
+
+test("getTurnCredentials: an invalid signed Home proof runs the verifier (denies) but never reaches the issuer", async () => {
+  delete process.env.TURN_REST_SECRET;
+  const otherKeyPair = generateEcKeyPair();
+  const garbageSignature = crypto
+    .sign("sha256", Buffer.from("not the real payload", "utf8"), otherKeyPair.privateKey)
+    .toString("base64");
+  const setup = await setupValidHomeScenario({ scenarioOverrides: { signatureOverride: garbageSignature } });
+
+  await assert.rejects(
+    getTurnCredentials.run(
+      fakeRequest(
+        { cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof },
+        setup.homeUid
+      )
+    ),
+    // permission-denied/DEVICE_PROOF_DENIED, never "internal" -- proves buildTurnCredentialsResponse
+    // (the issuer, which would throw "internal" for a missing secret) was never reached.
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_PROOF_DENIED"
+  );
+
+  // The verifier DID run (it read and evaluated the challenge) but must never have consumed it --
+  // an invalid signature is denied before the atomic consumption step.
+  const challengeDoc = await challengeRef(setup.challengeId).get();
+  assert.equal(challengeDoc.data().usedAt, null, "an invalid proof must never consume the challenge");
 
   await setup.cleanup();
 });

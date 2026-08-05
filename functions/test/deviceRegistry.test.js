@@ -535,7 +535,13 @@ test("12/13. releaseCameraFromCamera (Camera-initiated unpair) clears ownerUid a
   assert.equal(data.revokedAt, null);
 });
 
-test("18/20. getTurnCredentials called by the Home owner records the Camera's authUid from cameraClaims, not the Home uid, and a registry conflict does not break it", async () => {
+// Called via the Camera legacy path (cameraAuthUid), not the Home owner -- getTurnCredentials now
+// requires a deviceProof for a Home-originated call (see turn-credentials.test.js's own
+// fail-closed tests) and rejects before ever reaching attachCameraOwner, so it can no longer be
+// used to exercise this lazy-migration side effect. attachCameraOwner's own behavior is identical
+// regardless of which linked identity (Home or Camera) triggered it -- both read the exact same
+// cameraClaims document -- so the Camera path is an equivalent, still-valid way to exercise it.
+test("18/20. getTurnCredentials (Camera legacy path) records the Camera's authUid from cameraClaims, not the Home uid, and a registry conflict does not break it", async () => {
   process.env.TURN_REST_SECRET = "device-registry-test-secret";
   await claimRef().set({ uid: OWNER_UID, cameraAuthUid: CAMERA_AUTH_UID });
   // A pre-existing, conflicting identity -- attachCameraOwner will skip the write, but
@@ -543,7 +549,7 @@ test("18/20. getTurnCredentials called by the Home owner records the Camera's au
   await seedRegisteredDevice(CAMERA_ID, { authUid: OTHER_CAMERA_AUTH_UID, ownerUid: null });
 
   const response = await getTurnCredentials.run(
-    fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, OWNER_UID)
+    fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, CAMERA_AUTH_UID)
   );
 
   assert.equal(response.iceServers.length, 1);
@@ -552,11 +558,11 @@ test("18/20. getTurnCredentials called by the Home owner records the Camera's au
   assert.equal((await registryRef(CAMERA_ID).get()).data().authUid, OTHER_CAMERA_AUTH_UID);
 });
 
-test("20. getTurnCredentials called by the Home owner (no conflict) records the Camera's authUid, not the Home's own uid", async () => {
+test("20. getTurnCredentials (Camera legacy path, no conflict) records the Camera's authUid, not the Home's own uid", async () => {
   process.env.TURN_REST_SECRET = "device-registry-test-secret";
   await claimRef().set({ uid: OWNER_UID, cameraAuthUid: CAMERA_AUTH_UID });
 
-  await getTurnCredentials.run(fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, OWNER_UID));
+  await getTurnCredentials.run(fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, CAMERA_AUTH_UID));
 
   const data = (await registryRef(CAMERA_ID).get()).data();
   assert.equal(data.role, "CAMERA");
@@ -2257,36 +2263,45 @@ async function seedEnforceDevice(overrides = {}) {
   });
 }
 
-test("enforcement: 26. an active Camera's linked Home still receives TURN credentials", async () => {
+// Called via the Camera legacy path (cameraAuthUid) -- getTurnCredentials now requires a
+// deviceProof for a Home-originated call and rejects with DEVICE_PROOF_REQUIRED before ever
+// reaching assertRegisteredDeviceOperational (see turn-credentials.test.js's own fail-closed
+// tests), so the Home owner uid can no longer be used to exercise this Camera-status enforcement
+// directly. assertRegisteredDeviceOperational(db, cameraDeviceId) checks the TARGET Camera's own
+// document -- identical regardless of whether the caller is Home (via a verified deviceProof; see
+// turnCredentialsDeviceProof.test.js's "a suspended/revoked target Camera is rejected (HOME
+// proof)") or Camera (legacy, here) -- so this is the same enforcement code path, still fully
+// covered.
+test("enforcement: 26. an active Camera's linked Home (Camera legacy path) still receives TURN credentials", async () => {
   process.env.TURN_REST_SECRET = "enforce-test-secret";
   await enforceClaimRef().set({ uid: ENFORCE_OWNER_UID, cameraAuthUid: ENFORCE_CAMERA_AUTH_UID });
   await seedEnforceDevice({ status: "active" });
 
   const response = await getTurnCredentials.run(
-    fakeRequest({ cameraDeviceId: ENFORCE_CAMERA_ID, purpose: "LIVE_VIEW" }, ENFORCE_OWNER_UID)
+    fakeRequest({ cameraDeviceId: ENFORCE_CAMERA_ID, purpose: "LIVE_VIEW" }, ENFORCE_CAMERA_AUTH_UID)
   );
 
   assert.equal(response.iceServers.length, 1);
 });
 
-test("enforcement: 27. a suspended Camera's linked Home is denied TURN credentials", async () => {
+test("enforcement: 27. a suspended Camera denies TURN credentials on its own legacy path", async () => {
   process.env.TURN_REST_SECRET = "enforce-test-secret";
   await enforceClaimRef().set({ uid: ENFORCE_OWNER_UID, cameraAuthUid: ENFORCE_CAMERA_AUTH_UID });
   await seedEnforceDevice({ status: "suspended", suspensionReason: "plan" });
 
   await assert.rejects(
-    getTurnCredentials.run(fakeRequest({ cameraDeviceId: ENFORCE_CAMERA_ID, purpose: "LIVE_VIEW" }, ENFORCE_OWNER_UID)),
+    getTurnCredentials.run(fakeRequest({ cameraDeviceId: ENFORCE_CAMERA_ID, purpose: "LIVE_VIEW" }, ENFORCE_CAMERA_AUTH_UID)),
     (err) => err.code === "failed-precondition" && err.message === "DEVICE_SUSPENDED_PLAN"
   );
 });
 
-test("enforcement: 28. a revoked Camera's linked Home is denied TURN credentials", async () => {
+test("enforcement: 28. a revoked Camera denies TURN credentials on its own legacy path", async () => {
   process.env.TURN_REST_SECRET = "enforce-test-secret";
   await enforceClaimRef().set({ uid: ENFORCE_OWNER_UID, cameraAuthUid: ENFORCE_CAMERA_AUTH_UID });
   await seedEnforceDevice({ status: "revoked", revokedAt: admin.firestore.Timestamp.now() });
 
   await assert.rejects(
-    getTurnCredentials.run(fakeRequest({ cameraDeviceId: ENFORCE_CAMERA_ID, purpose: "LIVE_VIEW" }, ENFORCE_OWNER_UID)),
+    getTurnCredentials.run(fakeRequest({ cameraDeviceId: ENFORCE_CAMERA_ID, purpose: "LIVE_VIEW" }, ENFORCE_CAMERA_AUTH_UID)),
     (err) => err.code === "failed-precondition" && err.message === "DEVICE_REVOKED"
   );
 });

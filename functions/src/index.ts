@@ -1241,11 +1241,15 @@ export async function getVerifiedCameraClaim(
 // but does not otherwise change the credentials issued -- it exists so
 // access requests are self-describing in logs/audits.
 //
-// Optionally accepts a `deviceProof` field (see deviceChallenges.ts) -- when present, the whole
-// call is authorized by a verified Keystore signature instead of (or in addition to, for the
-// registry-bookkeeping side effects) the plain cameraClaims/entitlements checks below. See the
-// callable's own body for the exact branch; when `deviceProof` is entirely absent, behavior is
-// byte-for-byte identical to before this was added.
+// deviceProof (see deviceChallenges.ts) is now MANDATORY for a HOME-originated call: a request
+// from the linked Home owner (cameraClaims.uid) that omits it is rejected outright with
+// DEVICE_PROOF_REQUIRED, before any registry write or credential issuance -- there is no unsigned
+// path left for Home. A CAMERA-originated call (cameraClaims.cameraAuthUid) may still omit
+// deviceProof and reach the pre-existing cameraClaims/entitlements-only path below unchanged --
+// edgeguard-camera-android's own TurnCredentialsProvider does not send a deviceProof yet, and this
+// callable must not silently break it. Whenever `deviceProof` IS present (either role), the whole
+// call is instead authorized by a verified Keystore signature -- see the callable's own body for
+// the exact branch.
 
 // Every TurnCredentialsChallengeVerificationFailureReason mapped to a deliberately narrow set of
 // public (code, message) pairs -- see deviceChallenges.ts's own doc on
@@ -1389,8 +1393,12 @@ export const getTurnCredentials = onCall(
     }
 
     // ---------------------------------------------------------------------------------------
-    // Existing flow, byte-for-byte unchanged -- reached only when `deviceProof` is entirely
-    // absent from the request. See this function's own top-level doc.
+    // No deviceProof field: the legacy, unsigned path -- reached only when `deviceProof` is
+    // entirely absent from the request. Camera does not yet send a compatible deviceProof (see
+    // this function's own top-level doc), so this path stays reachable for Camera-originated
+    // calls, unchanged in every respect below. For a HOME-originated call, this path is now
+    // fail-closed -- see the DEVICE_PROOF_REQUIRED check immediately below; everything after it
+    // is exactly as before.
     // ---------------------------------------------------------------------------------------
     const claim = await getVerifiedCameraClaim(db, cameraDeviceId, uid);
 
@@ -1404,13 +1412,23 @@ export const getTurnCredentials = onCall(
       throw new HttpsError("permission-denied", "PERMISSION_DENIED");
     }
 
+    // Fail-closed for HOME: the caller is the linked Home owner (cameraClaims.uid) -- the same
+    // distinction claim.access === "ok" already relies on -- but sent no deviceProof at all. Home
+    // no longer has a working unsigned path; only the Camera side (claim.cameraAuthUid) may still
+    // reach the legacy issuance below. Checked before any write (attachCameraOwner) or further
+    // read, so a rejected request performs no side effects. Logs only `purpose` -- never
+    // cameraDeviceId/uid -- for this specific new rejection line.
+    if (uid === claim.ownerUid) {
+      logger.info("GET_TURN_CREDENTIALS_DEVICE_PROOF_REQUIRED", { purpose });
+      throw new HttpsError("failed-precondition", "DEVICE_PROOF_REQUIRED");
+    }
+
     // Best-effort device-registry lazy migration (see deviceRegistry.ts) for an already-paired
     // Camera that predates this registry -- only reached once getVerifiedCameraClaim above has
-    // already confirmed `uid` is a linked identity (Home owner or Camera) for this camera, using
-    // the SAME cameraClaims read that access check already performed (no second, potentially
-    // inconsistent read). getTurnCredentials is called by both Home and Camera, so the Camera's
-    // authUid is always read from cameraClaims itself, never from `uid` (the caller). Never
-    // blocks or changes this function's response.
+    // already confirmed `uid` is the linked Camera identity for this camera (the HOME branch
+    // above always returns first), using the SAME cameraClaims read that access check already
+    // performed (no second, potentially inconsistent read). Never blocks or changes this
+    // function's response.
     await attachCameraOwner(db, cameraDeviceId, claim.cameraAuthUid, claim.ownerUid as string);
 
     // Device-status enforcement: a suspended/revoked Camera may not vend TURN credentials to

@@ -97,6 +97,29 @@ test("createDeviceChallenge: unknown purpose is rejected", async () => {
   );
 });
 
+test("createDeviceChallenge: missing deviceId is rejected", async () => {
+  await assert.rejects(
+    createDeviceChallenge.run(
+      fakeRequest(
+        { purpose: "TURN_CREDENTIALS", requestPayload: { cameraDeviceId: "dc-missingid-camera", turnPurpose: "LIVE_VIEW" } },
+        "dc-missingid-uid"
+      )
+    ),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_DEVICE_ID"
+  );
+});
+
+test("createDeviceChallenge: empty/blank deviceId is rejected", async () => {
+  await assert.rejects(
+    createDeviceChallenge.run(fakeRequest(turnRequestData("", ""), "dc-blankid-uid")),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_DEVICE_ID"
+  );
+  await assert.rejects(
+    createDeviceChallenge.run(fakeRequest(turnRequestData("   ", "   "), "dc-blankid-uid-2")),
+    (err) => err.code === "invalid-argument" && err.message === "INVALID_DEVICE_ID"
+  );
+});
+
 test("createDeviceChallenge: client-supplied role field is rejected", async () => {
   await assert.rejects(
     createDeviceChallenge.run(

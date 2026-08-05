@@ -348,39 +348,51 @@ test.afterEach(async () => {
   delete process.env.TURN_REST_SECRET;
 });
 
+// Called via the Camera legacy path (cameraAuthUid), not the Home owner -- getTurnCredentials now
+// requires a deviceProof for a Home-originated call and rejects with DEVICE_PROOF_REQUIRED before
+// ever reaching the entitlements check (see turn-credentials.test.js's own fail-closed tests), so
+// the Home owner uid can no longer be used to exercise this gate directly. The entitlements check
+// itself (`getEffectiveUserEntitlements(uid, db)`) is keyed on whichever uid actually called --
+// unchanged code, identical regardless of caller identity -- so seeding
+// userEntitlements/{CAMERA_AUTH_UID} and calling as CAMERA_AUTH_UID exercises the exact same gate.
+
 test("getTurnCredentials: does not issue credentials when TURN access is denied (blocked)", async () => {
   process.env.TURN_REST_SECRET = "entitlements-test-secret";
   await claimRef().set({ uid: OWNER_UID, cameraAuthUid: CAMERA_AUTH_UID });
-  await entitlementsRef(OWNER_UID).set(validDoc({ subscriptionStatus: "blocked" }));
+  await entitlementsRef(CAMERA_AUTH_UID).set(validDoc({ subscriptionStatus: "blocked" }));
 
   await assert.rejects(
-    getTurnCredentials.run(fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, OWNER_UID)),
+    getTurnCredentials.run(fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, CAMERA_AUTH_UID)),
     (err) => err.code === "permission-denied" && err.message === "TURN_ACCESS_DENIED"
   );
+
+  await entitlementsRef(CAMERA_AUTH_UID).delete();
 });
 
 test("getTurnCredentials: does not issue credentials when turnAccessAllowed is explicitly false", async () => {
   process.env.TURN_REST_SECRET = "entitlements-test-secret";
   await claimRef().set({ uid: OWNER_UID, cameraAuthUid: CAMERA_AUTH_UID });
-  await entitlementsRef(OWNER_UID).set(validDoc({ turnAccessAllowed: false }));
+  await entitlementsRef(CAMERA_AUTH_UID).set(validDoc({ turnAccessAllowed: false }));
 
   await assert.rejects(
-    getTurnCredentials.run(fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, OWNER_UID)),
+    getTurnCredentials.run(fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, CAMERA_AUTH_UID)),
     (err) => err.code === "permission-denied" && err.message === "TURN_ACCESS_DENIED"
   );
+
+  await entitlementsRef(CAMERA_AUTH_UID).delete();
 });
 
 test("getTurnCredentials: a missing entitlements document does not break an existing Free user", async () => {
   process.env.TURN_REST_SECRET = "entitlements-test-secret";
   await claimRef().set({ uid: OWNER_UID, cameraAuthUid: CAMERA_AUTH_UID });
-  // Deliberately no userEntitlements/{OWNER_UID} document at all.
+  // Deliberately no userEntitlements/{CAMERA_AUTH_UID} document at all.
 
   const response = await getTurnCredentials.run(
-    fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, OWNER_UID)
+    fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, CAMERA_AUTH_UID)
   );
 
   assert.equal(response.iceServers.length, 1);
-  assert.match(response.iceServers[0].username, new RegExp(`^\\d+:${OWNER_UID}$`));
+  assert.match(response.iceServers[0].username, new RegExp(`^\\d+:${CAMERA_AUTH_UID}$`));
 });
 
 // --- 15. secret/credentials never appear in warning/error logs -------------
@@ -416,16 +428,18 @@ test("logs: TURN secret and issued credentials never appear in warning/error log
   const secret = "must-never-be-logged-secret";
   process.env.TURN_REST_SECRET = secret;
   await claimRef().set({ uid: OWNER_UID, cameraAuthUid: CAMERA_AUTH_UID });
-  await entitlementsRef(OWNER_UID).set(validDoc({ turnAccessAllowed: false }));
+  await entitlementsRef(CAMERA_AUTH_UID).set(validDoc({ turnAccessAllowed: false }));
 
   const output = await captureStdio(async () => {
     await assert.rejects(
-      getTurnCredentials.run(fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, OWNER_UID)),
+      getTurnCredentials.run(fakeRequest({ cameraDeviceId: CAMERA_ID, purpose: "LIVE_VIEW" }, CAMERA_AUTH_UID)),
       (err) => err.code === "permission-denied"
     );
   });
 
   assert.ok(!output.includes(secret), "raw TURN_REST_SECRET value must never be logged");
+
+  await entitlementsRef(CAMERA_AUTH_UID).delete();
 });
 
 test("logs: corrupt entitlements document warning never contains the uid", async () => {
