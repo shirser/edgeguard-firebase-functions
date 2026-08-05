@@ -408,14 +408,24 @@ export const claimCameraForUser = onCall(
     const secretHash = hashSecret(pairingSecret);
 
     const registryRef = db.collection("registeredDevices").doc(cameraDeviceId);
+    const entitlementsRef = db.collection("userEntitlements").doc(uid);
 
     const txResult = await db.runTransaction(async (t) => {
-      const [userSnap, claimSnap, pairingSnap, registrySnap] = await Promise.all([
+      const [userSnap, claimSnap, pairingSnap, registrySnap, entitlementsSnap] = await Promise.all([
         t.get(userRef),
         t.get(claimRef),
         t.get(pairingRef),
         t.get(registryRef),
+        t.get(entitlementsRef),
       ]);
+
+      // Canonical source of truth for the Camera-count limit (see entitlements.ts) -- read inside
+      // this same transaction, not via a second, separately-timed call to getPlanDeviceLimits, so
+      // this decision is atomic with the rest of the claim exactly like every other read here.
+      // Legacy users/{uid}.subscriptionUnits is never consulted for this decision anymore.
+      const deviceLimits = planDeviceLimitsFromEntitlementsData(
+        entitlementsSnap.exists ? entitlementsSnap.data() : undefined
+      );
 
       // Validate pairing session
       const sessionExpiresAt = pairingSnap.get(
@@ -478,11 +488,9 @@ export const claimCameraForUser = onCall(
 
           logger.info("CLAIM_CAMERA_PAIRING_STATE_WRITE_QUEUED", { cameraDeviceId });
 
-          const subscriptionUnits: number =
-            (userSnap.get("subscriptionUnits") as number) ?? 0;
           return {
             cameraCount: (userSnap.get("cameraCount") as number) ?? 0,
-            cameraLimit: 1 + subscriptionUnits * 5,
+            cameraLimit: deviceLimits.maxCameras,
             pairingStateWritten: true,
             cameraAuthUid: claimSnap.get("cameraAuthUid") as string | null | undefined,
           };
@@ -491,13 +499,10 @@ export const claimCameraForUser = onCall(
         throw new HttpsError("failed-precondition", "CAMERA_ALREADY_CLAIMED");
       }
 
-      const subscriptionUnits: number = userSnap.exists
-        ? ((userSnap.get("subscriptionUnits") as number) ?? 0)
-        : 0;
       const currentCameraCount: number = userSnap.exists
         ? ((userSnap.get("cameraCount") as number) ?? 0)
         : 0;
-      const allowedCameraCount = 1 + subscriptionUnits * 5;
+      const allowedCameraCount = deviceLimits.maxCameras;
       const nextCameraCount = currentCameraCount + 1;
 
       logger.info("CAMERA_LIMIT_CHECK", {
@@ -505,7 +510,6 @@ export const claimCameraForUser = onCall(
         cameraDeviceId,
         currentCameraCount,
         nextCameraCount,
-        subscriptionUnits,
         allowedCameraCount,
       });
 
@@ -515,7 +519,6 @@ export const claimCameraForUser = onCall(
           cameraDeviceId,
           currentCameraCount,
           nextCameraCount,
-          subscriptionUnits,
           allowedCameraCount,
         });
         throw new HttpsError("resource-exhausted", "Camera limit reached", {
@@ -523,7 +526,6 @@ export const claimCameraForUser = onCall(
           currentCameraCount,
           nextCameraCount,
           allowedCameraCount,
-          subscriptionUnits,
         });
       }
 
@@ -744,10 +746,13 @@ export const releaseCameraForUser = onCall(
       .collection("pairingState")
       .doc("current");
 
+    const entitlementsRef = db.collection("userEntitlements").doc(uid);
+
     await db.runTransaction(async (t) => {
-      const [claimSnap, userSnap] = await Promise.all([
+      const [claimSnap, userSnap, entitlementsSnap] = await Promise.all([
         t.get(claimRef),
         t.get(userRef),
+        t.get(entitlementsRef),
       ]);
 
       if (!claimSnap.exists || (claimSnap.get("uid") as string) !== uid) {
@@ -768,9 +773,13 @@ export const releaseCameraForUser = onCall(
         | string
         | undefined;
 
-      const subscriptionUnits: number =
-        (userSnap.get("subscriptionUnits") as number) ?? 0;
-      const cameraLimit = 1 + subscriptionUnits * 5;
+      // Canonical source of truth for the legacy users/{uid}.cameraLimit compatibility mirror
+      // (see entitlements.ts) -- read inside this same transaction. This is a write-back value
+      // only; no decision in this function depends on it.
+      const deviceLimits = planDeviceLimitsFromEntitlementsData(
+        entitlementsSnap.exists ? entitlementsSnap.data() : undefined
+      );
+      const cameraLimit = deviceLimits.maxCameras;
 
       const now = admin.firestore.FieldValue.serverTimestamp();
 
@@ -863,7 +872,8 @@ export const unpairCameraFromDevice = onCall(
 
       const userRef = db.collection("users").doc(ownerUid);
       const cameraDeviceRef = userRef.collection("cameraDevices").doc(cameraDeviceId);
-      const userSnap = await t.get(userRef);
+      const entitlementsRef = db.collection("userEntitlements").doc(ownerUid);
+      const [userSnap, entitlementsSnap] = await Promise.all([t.get(userRef), t.get(entitlementsRef)]);
 
       const now = admin.firestore.FieldValue.serverTimestamp();
 
@@ -871,12 +881,15 @@ export const unpairCameraFromDevice = onCall(
       t.delete(cameraDeviceRef);
 
       if (userSnap.exists) {
-        const subscriptionUnits: number =
-          (userSnap.get("subscriptionUnits") as number) ?? 0;
-        const cameraLimit = 1 + subscriptionUnits * 5;
+        // Canonical source of truth for the legacy users/{uid}.cameraLimit compatibility mirror
+        // (see entitlements.ts) -- read inside this same transaction. Write-back value only; no
+        // decision in this function depends on it.
+        const deviceLimits = planDeviceLimitsFromEntitlementsData(
+          entitlementsSnap.exists ? entitlementsSnap.data() : undefined
+        );
         t.update(userRef, {
           cameraCount: admin.firestore.FieldValue.increment(-1),
-          cameraLimit,
+          cameraLimit: deviceLimits.maxCameras,
           updatedAt: now,
         });
       }
@@ -954,11 +967,13 @@ export const releaseCameraFromCamera = onCall(
         const cameraDeviceRef = userRef
           .collection("cameraDevices")
           .doc(cameraDeviceId);
+        const entitlementsRef = db.collection("userEntitlements").doc(ownerUid);
 
-        const [userSnap, cameraDeviceSnap, pairingStateSnap] = await Promise.all([
+        const [userSnap, cameraDeviceSnap, pairingStateSnap, entitlementsSnap] = await Promise.all([
           t.get(userRef),
           t.get(cameraDeviceRef),
           t.get(pairingStateRef),
+          t.get(entitlementsRef),
         ]);
 
         logger.info("RELEASE_CAMERA_FROM_CAMERA_READ", {
@@ -974,16 +989,19 @@ export const releaseCameraFromCamera = onCall(
         t.delete(cameraDeviceRef);
 
         if (userSnap.exists) {
-          const subscriptionUnits: number =
-            (userSnap.get("subscriptionUnits") as number) ?? 0;
           const cameraCount: number =
             (userSnap.get("cameraCount") as number) ?? 0;
           const newCameraCount = Math.max(0, cameraCount - 1);
-          const cameraLimit = 1 + subscriptionUnits * 5;
+          // Canonical source of truth for the legacy users/{uid}.cameraLimit compatibility mirror
+          // (see entitlements.ts) -- read inside this same transaction. Write-back value only; no
+          // decision in this function depends on it.
+          const deviceLimits = planDeviceLimitsFromEntitlementsData(
+            entitlementsSnap.exists ? entitlementsSnap.data() : undefined
+          );
 
           t.update(userRef, {
             cameraCount: newCameraCount,
-            cameraLimit,
+            cameraLimit: deviceLimits.maxCameras,
             updatedAt: now,
           });
         }

@@ -315,6 +315,34 @@ test("getEffectiveUserEntitlements: unknown source is treated as a corrupt docum
   assert.equal((await getEffectiveUserEntitlements(uid, db)).plan, "free");
 });
 
+test("getEffectiveUserEntitlements: a string in place of a numeric limit is treated as a corrupt document -> Free", async () => {
+  const uid = "uid-string-limit";
+  await entitlementsRef(uid).set(validDoc({ maxCameras: "5" }));
+
+  const result = await getEffectiveUserEntitlements(uid, db);
+  assert.equal(result.plan, "free");
+  assert.equal(result.maxCameras, 1);
+});
+
+test("getEffectiveUserEntitlements: NaN/Infinity in a numeric limit is treated as a corrupt document -> Free", async () => {
+  const nanUid = "uid-nan-limit";
+  const infinityUid = "uid-infinity-limit";
+  await entitlementsRef(nanUid).set(validDoc({ maxCameras: NaN }));
+  await entitlementsRef(infinityUid).set(validDoc({ maxHomeDevices: Infinity }));
+
+  assert.equal((await getEffectiveUserEntitlements(nanUid, db)).maxCameras, 1);
+  assert.equal((await getEffectiveUserEntitlements(infinityUid, db)).maxHomeDevices, 1);
+});
+
+test("getEffectiveUserEntitlements: a string in place of turnAccessAllowed is treated as a corrupt document -> Free", async () => {
+  const uid = "uid-string-turn-access";
+  await entitlementsRef(uid).set(validDoc({ turnAccessAllowed: "true" }));
+
+  const result = await getEffectiveUserEntitlements(uid, db);
+  assert.equal(result.plan, "free");
+  assert.equal(result.turnAccessAllowed, true);
+});
+
 test("getEffectiveUserEntitlements: missing required field is treated as a corrupt document -> Free", async () => {
   const uid = "uid-missing-field";
   const doc = validDoc();

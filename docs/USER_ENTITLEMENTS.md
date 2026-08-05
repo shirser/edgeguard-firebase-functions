@@ -15,10 +15,18 @@ This document covers the entitlements model itself. It does **not** cover
 - a concurrent Live View session limit
 - rate limiting
 
-Today, only `turnAccessAllowed` is actually enforced (in `getTurnCredentials`,
-see below). `maxCameras`, `maxHomeDevices`, and `maxConcurrentLiveSessions`
-are stored and resolved, but nothing checks them yet — that requires the
-device registry and server-side Live View session tracking listed above.
+Today, `turnAccessAllowed` (in `getTurnCredentials`, see below) and
+`maxCameras` (in `claimCameraForUser`'s existing, non-transactional-limit
+camera-count check) are enforced. `maxHomeDevices` and
+`maxConcurrentLiveSessions` are stored and resolved, but nothing checks them
+synchronously yet — `maxHomeDevices` is only applied by the best-effort
+reconcile pass (`reconcileDevicesOnEntitlementChange` /
+`reconcileUserDeviceLimits`, deviceRegistry.ts), and
+`maxConcurrentLiveSessions` requires server-side Live View session tracking
+listed above. The legacy `users/{uid}.cameraLimit`/`subscriptionUnits`
+fields are no longer read for any of these decisions — `cameraLimit` is
+still written back as an inert compatibility mirror, always populated from
+this canonical `maxCameras`, never the other way around.
 
 ## Firestore document
 
@@ -162,9 +170,12 @@ before issuing TURN credentials. The client only ever sees the generic
 `permission-denied` / `TURN_ACCESS_DENIED` error — never the internal reason
 (plan, blocked status, expiry, or any other document detail).
 
-`maxCameras`, `maxHomeDevices`, and `maxConcurrentLiveSessions` are **not**
-checked here yet. They will be wired in once a device registry and
-server-side Live View session tracking exist.
+`maxHomeDevices` and `maxConcurrentLiveSessions` are **not** checked
+synchronously here or anywhere else yet (`maxHomeDevices` is only enforced
+by the best-effort reconcile pass; `maxConcurrentLiveSessions` needs
+server-side Live View session tracking). `maxCameras` is enforced
+separately, in `claimCameraForUser` (see its own transaction) -- not part of
+this callable.
 
 ## Example documents
 
