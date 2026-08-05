@@ -1260,9 +1260,10 @@ export async function getVerifiedCameraClaim(
 // DEVICE_SUSPENDED[..._PLAN], DEVICE_REVOKED, TURN_ACCESS_DENIED) for consistency. Every reason
 // that could function as a signature/authorization oracle (challenge id/purpose/authUid/schema/
 // nonce/requestHash format, role mismatch, request-hash-after-tampering mismatch, camera target
-// mismatch, camera claim/access denial, and the signature itself) collapses to one generic
-// permission-denied/DEVICE_PROOF_DENIED -- a caller can never use the response to tell "almost a
-// valid signature" apart from "wrong challenge" or "wrong camera".
+// mismatch, camera claim/access denial, the Home-device-to-Camera link mismatch, and the
+// signature itself) collapses to one generic permission-denied/DEVICE_PROOF_DENIED -- a caller
+// can never use the response to tell "almost a valid signature" apart from "wrong challenge",
+// "wrong camera", or "valid signature, but this Home installation never claimed this camera".
 function mapTurnCredentialsChallengeDenialToHttpsError(
   reason: TurnCredentialsChallengeVerificationFailureReason
 ): HttpsError {
@@ -1330,11 +1331,17 @@ export const getTurnCredentials = onCall(
       request.data !== null && typeof request.data === "object" && "deviceProof" in request.data;
 
     if (hasDeviceProofField) {
+      // Signed Home/Camera flow -- logging here follows a stricter contract than the rest of this
+      // callable: only `stage`/`purpose`/`role`/a machine-readable `reason` are ever logged, never
+      // any identifier (deviceId/verifiedHomeDeviceId/cameraDeviceId/challengeId/uid/ownerUid/
+      // cameraAuthUid) or cryptographic material. This whole branch (envelope validation through
+      // the verified actor's own device-level authorization below) is exactly what that contract
+      // protects.
       const proofValidation = validateTurnCredentialsDeviceProof(deviceProof);
       if (!proofValidation.valid) {
         logger.info("TURN_DEVICE_PROOF_VERIFY_DENIED", {
-          cameraDeviceId,
-          turnPurpose: purpose,
+          stage: "envelope",
+          purpose,
           reason: proofValidation.reason,
         });
         throw new HttpsError("invalid-argument", "INVALID_DEVICE_PROOF");
@@ -1342,9 +1349,8 @@ export const getTurnCredentials = onCall(
       const proof = proofValidation.proof;
 
       logger.info("TURN_DEVICE_PROOF_VERIFY_START", {
-        challengeId: proof.challengeId,
-        cameraDeviceId,
-        turnPurpose: purpose,
+        stage: "verify",
+        purpose,
         protocolVersion: proof.protocolVersion,
       });
 
@@ -1358,20 +1364,17 @@ export const getTurnCredentials = onCall(
 
       if (consumption.outcome !== "verified") {
         logger.info("TURN_DEVICE_PROOF_VERIFY_DENIED", {
-          challengeId: proof.challengeId,
-          cameraDeviceId,
-          turnPurpose: purpose,
+          stage: "verify",
+          purpose,
           reason: consumption.reason,
         });
         throw mapTurnCredentialsChallengeDenialToHttpsError(consumption.reason);
       }
 
       logger.info("TURN_DEVICE_PROOF_VERIFY_SUCCESS", {
-        challengeId: proof.challengeId,
-        deviceId: consumption.deviceId,
+        stage: "verify",
+        purpose,
         role: consumption.role,
-        cameraDeviceId,
-        turnPurpose: purpose,
       });
 
       // Best-effort device-registry lazy migration -- same call, same non-blocking semantics, as
@@ -1383,11 +1386,11 @@ export const getTurnCredentials = onCall(
       try {
         proofResponse = buildTurnCredentialsResponse(turnRestSecret.value(), uid);
       } catch (error) {
-        logger.error("GET_TURN_CREDENTIALS_MISSING_SECRET", { uid, cameraDeviceId, purpose });
+        logger.error("GET_TURN_CREDENTIALS_MISSING_SECRET", { stage: "issue", purpose });
         throw error;
       }
 
-      logger.info("GET_TURN_CREDENTIALS_SUCCESS", { uid, cameraDeviceId, purpose });
+      logger.info("GET_TURN_CREDENTIALS_SUCCESS", { stage: "issue", purpose, role: consumption.role });
 
       return proofResponse;
     }

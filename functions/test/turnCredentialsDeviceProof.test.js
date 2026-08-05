@@ -34,6 +34,11 @@ function challengeRef(challengeId) {
 function entitlementsRef(uid) {
   return db.collection("userEntitlements").doc(uid);
 }
+// The canonical Home<->Camera link claimCameraForUser (index.ts) writes once, at real claim time
+// -- function-only-writable (firestore.rules: `allow write: if false` on this subcollection).
+function homeCameraLinkRef(ownerUid, cameraDeviceId) {
+  return db.collection("users").doc(ownerUid).collection("cameraDevices").doc(cameraDeviceId);
+}
 
 // Minimal CallableRequest stand-in -- same convention as turn-credentials.test.js.
 function fakeRequest(data, uid) {
@@ -176,6 +181,21 @@ async function setupValidHomeScenario(overrides = {}) {
     ...(overrides.claimOverrides ?? {}),
   });
 
+  // The canonical Home<->Camera link (see homeCameraLinkRef's own doc) -- pass
+  // `homeCameraLinkOverrides: null` to omit it entirely (tests the missing-link denial), or an
+  // object to override specific fields (e.g. a different homeDeviceId, to test the link-mismatch
+  // denial) -- omitting the key altogether (the default) seeds the exact shape
+  // claimCameraForUser itself writes.
+  if (overrides.homeCameraLinkOverrides !== null) {
+    await homeCameraLinkRef(homeUid, cameraDeviceId).set({
+      cameraDeviceId,
+      homeDeviceId,
+      pairedAt: admin.firestore.Timestamp.now(),
+      status: "active",
+      ...(overrides.homeCameraLinkOverrides ?? {}),
+    });
+  }
+
   const scenario = buildDeviceProofScenario({
     role: "HOME",
     deviceId: homeDeviceId,
@@ -200,6 +220,7 @@ async function setupValidHomeScenario(overrides = {}) {
         claimRef(cameraDeviceId).delete(),
         challengeRef(scenario.challengeId).delete(),
         entitlementsRef(homeUid).delete(),
+        homeCameraLinkRef(homeUid, cameraDeviceId).delete(),
       ]);
     },
   };
@@ -1055,6 +1076,362 @@ test("getTurnCredentials: an invalid signed Home proof runs the verifier (denies
   // an invalid signature is denied before the atomic consumption step.
   const challengeDoc = await challengeRef(setup.challengeId).get();
   assert.equal(challengeDoc.data().usedAt, null, "an invalid proof must never consume the challenge");
+
+  await setup.cleanup();
+});
+
+// =================================================================================================
+// Home-device-to-Camera authorization -- verifiedHomeDeviceId, extracted from the verified
+// challenge, must be the specific Home installation users/{ownerUid}/cameraDevices/{cameraDeviceId}
+// records as having claimed this camera. cameraClaims.uid === request.auth.uid alone (already
+// checked above) only proves ACCOUNT-level ownership, not which Home installation signed.
+// =================================================================================================
+
+// --- Actor identity is extracted from the verified challenge, never from the request -----------
+
+test("consumeVerifiedTurnCredentialsChallenge: the verified outcome's deviceId is the challenge's own device, not the caller's uid or any request field", async () => {
+  const setup = await setupValidHomeScenario();
+
+  const consumption = await consumeVerifiedTurnCredentialsChallenge(db, {
+    requestAuthUid: setup.homeUid,
+    cameraDeviceId: setup.cameraDeviceId,
+    turnPurpose: TURN_PURPOSE,
+    deviceProof: setup.deviceProof,
+    nowMillis: Date.now(),
+  });
+
+  assert.equal(consumption.outcome, "verified");
+  assert.equal(consumption.deviceId, setup.homeDeviceId);
+  assert.notEqual(consumption.deviceId, setup.homeUid, "deviceId must never equal the auth uid");
+  assert.equal(consumption.role, "HOME");
+
+  await setup.cleanup();
+});
+
+test("getTurnCredentials: a request with no homeDeviceId/deviceId field at all still completes the signed Home flow", async () => {
+  process.env.TURN_REST_SECRET = "dp-noid-secret";
+  const setup = await setupValidHomeScenario();
+
+  // Exactly the documented request shape -- cameraDeviceId, purpose, deviceProof. No homeDeviceId,
+  // no deviceId, ever.
+  const request = { cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof };
+  assert.deepEqual(Object.keys(request).sort(), ["cameraDeviceId", "deviceProof", "purpose"].sort());
+
+  const response = await getTurnCredentials.run(fakeRequest(request, setup.homeUid));
+  assert.equal(response.iceServers.length, 1);
+
+  await setup.cleanup();
+});
+
+test("getTurnCredentials: a forged top-level homeDeviceId/deviceId/role field is ignored -- the verified actor is unchanged", async () => {
+  process.env.TURN_REST_SECRET = "dp-forged-fields-secret";
+  const setup = await setupValidHomeScenario();
+
+  const response = await getTurnCredentials.run(
+    fakeRequest(
+      {
+        cameraDeviceId: setup.cameraDeviceId,
+        purpose: TURN_PURPOSE,
+        deviceProof: setup.deviceProof,
+        // None of these are part of the documented contract and none are ever read for
+        // authorization -- the actor identity comes only from the verified challenge.
+        homeDeviceId: "attacker-supplied-home-device-id",
+        deviceId: "attacker-supplied-device-id",
+        role: "CAMERA",
+        authUid: "attacker-supplied-auth-uid",
+        ownerUid: "attacker-supplied-owner-uid",
+      },
+      setup.homeUid
+    )
+  );
+
+  assert.equal(response.iceServers.length, 1);
+  assert.match(response.iceServers[0].username, new RegExp(`^\\d+:${setup.homeUid}$`));
+
+  await setup.cleanup();
+});
+
+// --- Home <-> Camera device-level authorization ---------------------------------------------
+
+test("getTurnCredentials: a Home device that claimed this Camera (canonical link) passes", async () => {
+  process.env.TURN_REST_SECRET = "dp-link-ok-secret";
+  const setup = await setupValidHomeScenario();
+
+  const response = await getTurnCredentials.run(
+    fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+  );
+
+  assert.equal(response.iceServers.length, 1);
+  await setup.cleanup();
+});
+
+test("getTurnCredentials: no Home<->Camera link document at all is denied (missing link, fail closed)", async () => {
+  const setup = await setupValidHomeScenario({ homeCameraLinkOverrides: null });
+
+  await assert.rejects(
+    getTurnCredentials.run(
+      fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_PROOF_DENIED"
+  );
+
+  await setup.cleanup();
+});
+
+test("getTurnCredentials: a different Home device under the SAME owner uid (matching account, wrong installation) is denied", async () => {
+  process.env.TURN_REST_SECRET = "dp-samewner-secret";
+  // The canonical link records THIS home device as the one that claimed the camera...
+  const linkedHomeDeviceId = uniqueId("dp-linked-home-device");
+  const setup = await setupValidHomeScenario({ homeCameraLinkOverrides: { homeDeviceId: linkedHomeDeviceId } });
+
+  // ...but setup.deviceProof is signed by setup.homeDeviceId, a DIFFERENT, also-registered Home
+  // installation on the exact same account (same homeUid/ownerUid) -- the same Google account
+  // signed into a second Home phone. cameraClaims.uid === request.auth.uid still matches (both
+  // devices share the same owner), so only the device-level link check can catch this.
+  assert.notEqual(setup.homeDeviceId, linkedHomeDeviceId);
+
+  await assert.rejects(
+    getTurnCredentials.run(
+      fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_PROOF_DENIED"
+  );
+
+  await setup.cleanup();
+});
+
+test("getTurnCredentials: matching ownerUid alone never bypasses the device-level link check", async () => {
+  // Same scenario as above, phrased as the core guarantee this task adds: account-level ownership
+  // (cameraClaims.uid === request.auth.uid) is necessary but not sufficient.
+  process.env.TURN_REST_SECRET = "dp-ownerbypass-secret";
+  const otherHomeDeviceId = uniqueId("dp-other-home-device");
+  const setup = await setupValidHomeScenario({ homeCameraLinkOverrides: { homeDeviceId: otherHomeDeviceId } });
+
+  const result = await consumeVerifiedTurnCredentialsChallenge(db, {
+    requestAuthUid: setup.homeUid, // the real, matching account owner
+    cameraDeviceId: setup.cameraDeviceId,
+    turnPurpose: TURN_PURPOSE,
+    deviceProof: setup.deviceProof, // signed by setup.homeDeviceId, NOT otherHomeDeviceId
+    nowMillis: Date.now(),
+  });
+
+  assert.equal(result.outcome, "denied");
+  assert.equal(result.reason, "HOME_CAMERA_LINK_MISMATCH");
+
+  await setup.cleanup();
+});
+
+test("getTurnCredentials: an unpaired (deleted) Home<->Camera link denies a previously-valid Home device", async () => {
+  process.env.TURN_REST_SECRET = "dp-unpaired-secret";
+  const setup = await setupValidHomeScenario();
+
+  // Simulates a real unpair: releaseCameraForUser/unpairCameraFromDevice/releaseCameraFromCamera
+  // all t.delete() this exact document.
+  await homeCameraLinkRef(setup.homeUid, setup.cameraDeviceId).delete();
+
+  await assert.rejects(
+    getTurnCredentials.run(
+      fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_PROOF_DENIED"
+  );
+
+  await setup.cleanup();
+});
+
+test("getTurnCredentials: a different owner's Home device is denied at the account level, before the device-link check", async () => {
+  process.env.TURN_REST_SECRET = "dp-otherowner-secret";
+  const setup = await setupValidHomeScenario();
+  const intruderUid = uniqueId("dp-intruder-uid");
+
+  // The claim is reassigned to a different owner -- claimOwnerUid no longer equals
+  // setup.homeUid (requestAuthUid), so this must be denied by the existing account-level check
+  // (CAMERA_ACCESS_DENIED) -- confirms the two layers (account-level, then device-level) are both
+  // still independently enforced, in the right order.
+  await claimRef(setup.cameraDeviceId).set({ uid: intruderUid, cameraAuthUid: setup.cameraAuthUid }, { merge: true });
+
+  const result = await consumeVerifiedTurnCredentialsChallenge(db, {
+    requestAuthUid: setup.homeUid,
+    cameraDeviceId: setup.cameraDeviceId,
+    turnPurpose: TURN_PURPOSE,
+    deviceProof: setup.deviceProof,
+    nowMillis: Date.now(),
+  });
+
+  assert.equal(result.outcome, "denied");
+  assert.equal(result.reason, "CAMERA_ACCESS_DENIED");
+
+  await setup.cleanup();
+  await claimRef(setup.cameraDeviceId).delete();
+});
+
+test("getTurnCredentials: a stranger Camera is never distinguished from a link-mismatch by error shape (no oracle)", async () => {
+  process.env.TURN_REST_SECRET = "dp-oracle-secret";
+  const linkMismatchSetup = await setupValidHomeScenario({ homeCameraLinkOverrides: null });
+  const notFoundResult = await assert.rejects(
+    getTurnCredentials.run(
+      fakeRequest({ cameraDeviceId: "dp-nonexistent-camera-oracle", purpose: TURN_PURPOSE, deviceProof: linkMismatchSetup.deviceProof }, linkMismatchSetup.homeUid)
+    )
+  );
+
+  const linkMismatchRejection = await getTurnCredentials
+    .run(fakeRequest({ cameraDeviceId: linkMismatchSetup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: linkMismatchSetup.deviceProof }, linkMismatchSetup.homeUid))
+    .catch((err) => err);
+
+  // Both are the exact same generic, non-distinguishing public rejection.
+  assert.equal(linkMismatchRejection.code, "permission-denied");
+  assert.equal(linkMismatchRejection.message, "DEVICE_PROOF_DENIED");
+
+  await linkMismatchSetup.cleanup();
+});
+
+// --- Regression: proof verifier / authorization lookup / TURN issuer call counts ----------------
+// Adapted to this repo's emulator-integration test style (no mocked seams -- see this file's
+// earlier regression test for the same convention). Each count is proxied through an observable
+// side effect:
+//   - invalid signature -> the verifier runs (transaction executes, reads the challenge) but
+//     denies before ever reaching the NEW Home<->Camera link lookup (see deviceChallenges.ts:
+//     signature is checked before that lookup specifically so this ordering holds) and before the
+//     issuer -- proxied via TURN_REST_SECRET being unset yet the error still being
+//     DEVICE_PROOF_DENIED, not "internal", AND via the target camera's registeredDevices document
+//     being completely untouched (the link lookup, had it run, would not itself write anything,
+//     but this also confirms attachCameraOwner/the issuer never ran).
+//   - valid proof, unauthorized Home (no/mismatched link) -> the verifier runs AND the link lookup
+//     runs (that's what produces HOME_CAMERA_LINK_MISMATCH) but the issuer is never reached --
+//     proxied the same way via the unset secret.
+//   - valid proof, authorized Home -> verifier runs, link lookup runs, issuer runs exactly once --
+//     a real TURN response is returned.
+
+test("regression: invalid signature never reaches the Home<->Camera authorization lookup or the issuer", async () => {
+  delete process.env.TURN_REST_SECRET;
+  const otherKeyPair = generateEcKeyPair();
+  const garbageSignature = crypto
+    .sign("sha256", Buffer.from("not the real payload", "utf8"), otherKeyPair.privateKey)
+    .toString("base64");
+  const setup = await setupValidHomeScenario({ scenarioOverrides: { signatureOverride: garbageSignature } });
+  const cameraBefore = (await registryRef(setup.cameraDeviceId).get()).data();
+
+  await assert.rejects(
+    getTurnCredentials.run(
+      fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_PROOF_DENIED"
+  );
+
+  const cameraAfter = (await registryRef(setup.cameraDeviceId).get()).data();
+  assert.deepEqual(cameraAfter.updatedAt, cameraBefore.updatedAt, "no registry write must happen past signature verification");
+
+  const challengeDoc = await challengeRef(setup.challengeId).get();
+  assert.equal(challengeDoc.data().usedAt, null, "an invalid signature must never consume the challenge");
+
+  await setup.cleanup();
+});
+
+test("regression: a valid proof with an unauthorized Home runs the link lookup but never the issuer", async () => {
+  delete process.env.TURN_REST_SECRET;
+  const setup = await setupValidHomeScenario({ homeCameraLinkOverrides: null });
+
+  await assert.rejects(
+    getTurnCredentials.run(
+      fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+    ),
+    // permission-denied/DEVICE_PROOF_DENIED, never "internal" -- proves the issuer
+    // (buildTurnCredentialsResponse, which would throw "internal" for the deliberately-unset
+    // secret) was never reached, even though the link lookup itself DID run (that's what produced
+    // this specific denial).
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_PROOF_DENIED"
+  );
+
+  const challengeDoc = await challengeRef(setup.challengeId).get();
+  assert.equal(challengeDoc.data().usedAt, null, "an unauthorized Home must never consume the challenge");
+
+  await setup.cleanup();
+});
+
+test("regression: a valid proof with an authorized Home runs verifier, link lookup, and issuer exactly once", async () => {
+  process.env.TURN_REST_SECRET = "dp-full-chain-secret";
+  const setup = await setupValidHomeScenario();
+
+  const response = await getTurnCredentials.run(
+    fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+  );
+
+  assert.equal(response.iceServers.length, 1);
+  const challengeDoc = await challengeRef(setup.challengeId).get();
+  assert.notEqual(challengeDoc.data().usedAt, null, "the verifier must consume the challenge exactly once");
+  assert.equal(challengeDoc.data().usedByFunction, "getTurnCredentials");
+
+  // A second call with the same (now-consumed) proof must not succeed again -- issuer runs at
+  // most once per proof, matching this file's own "reusing the same signature" test above.
+  await assert.rejects(
+    getTurnCredentials.run(
+      fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+    ),
+    (err) => err.code === "failed-precondition" && err.message === "CHALLENGE_ALREADY_USED"
+  );
+
+  await setup.cleanup();
+});
+
+test("regression: a denied signed Home request never reaches the Camera legacy path (no attachCameraOwner side effect)", async () => {
+  const setup = await setupValidHomeScenario({ homeCameraLinkOverrides: null });
+  const before = (await registryRef(setup.cameraDeviceId).get()).data();
+
+  await assert.rejects(
+    getTurnCredentials.run(
+      fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+    ),
+    (err) => err.code === "permission-denied" && err.message === "DEVICE_PROOF_DENIED"
+  );
+
+  // attachCameraOwner (the Camera legacy-path bookkeeping call) always bumps updatedAt/lastSeenAt
+  // on an existing, identity-matching registeredDevices document -- it is only ever invoked after
+  // consumption.outcome === "verified", so it must never have run here.
+  const after = (await registryRef(setup.cameraDeviceId).get()).data();
+  assert.deepEqual(after.updatedAt, before.updatedAt);
+  assert.deepEqual(after.lastSeenAt, before.lastSeenAt);
+
+  await setup.cleanup();
+});
+
+// --- Logging: the new Home-device-to-Camera authorization must never log identifiers -----------
+
+test("getTurnCredentials: Home<->Camera link mismatch never logs homeDeviceId, cameraDeviceId, challengeId, authUid, or ownerUid", async () => {
+  const setup = await setupValidHomeScenario({ homeCameraLinkOverrides: null });
+
+  const output = await captureStdio(async () => {
+    await assert.rejects(
+      getTurnCredentials.run(
+        fakeRequest({ cameraDeviceId: setup.cameraDeviceId, purpose: TURN_PURPOSE, deviceProof: setup.deviceProof }, setup.homeUid)
+      )
+    );
+  });
+
+  // Inspect only the specific TURN_DEVICE_PROOF_VERIFY_* log entries this task's stricter
+  // contract governs -- not the whole captured output, which also (legitimately, unchanged, out
+  // of this task's scope) includes the pre-existing GET_TURN_CREDENTIALS_START line logging
+  // uid/cameraDeviceId, same as every other pre-existing log line in this callable (see
+  // turn-credentials.test.js's own equivalent scoping decision for the DEVICE_PROOF_REQUIRED
+  // rejection line).
+  const proofLines = output.split("\n").filter((line) => line.includes("TURN_DEVICE_PROOF_VERIFY_"));
+  assert.ok(proofLines.some((line) => line.includes("TURN_DEVICE_PROOF_VERIFY_DENIED")), "the denial log line should still fire");
+
+  const forbidden = [setup.homeDeviceId, setup.cameraDeviceId, setup.challengeId, setup.homeUid, setup.deviceProof.signature];
+  for (const line of proofLines) {
+    const entry = JSON.parse(line);
+    // Every field on every TURN_DEVICE_PROOF_VERIFY_* entry must be one of the explicitly allowed
+    // safe fields (stage/purpose/role/protocolVersion/reason/message/severity) -- never an
+    // identifier.
+    for (const key of Object.keys(entry)) {
+      assert.ok(
+        ["stage", "purpose", "role", "protocolVersion", "reason", "message", "severity"].includes(key),
+        `unexpected field "${key}" on log entry: ${line}`
+      );
+    }
+    for (const needle of forbidden) {
+      assert.ok(!line.includes(needle), `log entry must not contain "${needle}": ${line}`);
+    }
+  }
 
   await setup.cleanup();
 });

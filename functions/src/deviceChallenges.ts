@@ -482,6 +482,7 @@ export type TurnCredentialsChallengeVerificationFailureReason =
   | "CAMERA_ACCESS_DENIED"
   | "TURN_ACCESS_DENIED"
   | "SIGNATURE_INVALID"
+  | "HOME_CAMERA_LINK_MISMATCH"
   | DeviceOperationalReason;
 
 export type TurnCredentialsChallengeConsumptionOutcome =
@@ -678,10 +679,13 @@ export async function consumeVerifiedTurnCredentialsChallenge(
       return { outcome: "denied", reason: "TURN_ACCESS_DENIED" };
     }
 
-    // 20. signature is valid -- last, most expensive check, exactly as documented. The canonical
-    // device-proof payload is rebuilt entirely server-side from already-verified, already-read
-    // fields -- the client's request never contains (and this function never trusts) a
-    // canonicalPayload string.
+    // 20. signature is valid -- the last check that can be decided from data already read above;
+    // deliberately checked before the HOME-device-link lookup just below, so an invalid signature
+    // (proof of possession never established) is denied without ever performing that lookup --
+    // whatever it might reveal about this camera's pairing stays unreached for a request that
+    // never proved which key it was signed with. The canonical device-proof payload is rebuilt
+    // entirely server-side from already-verified, already-read fields -- the client's request
+    // never contains (and this function never trusts) a canonicalPayload string.
     const canonicalDeviceProofPayload = buildCanonicalDeviceProofPayload({
       challengeId: deviceProof.challengeId,
       deviceId,
@@ -699,6 +703,39 @@ export async function consumeVerifiedTurnCredentialsChallenge(
     );
     if (!signatureValid) {
       return { outcome: "denied", reason: "SIGNATURE_INVALID" };
+    }
+
+    // 21. HOME-specific device-level authorization. Step 17 above (cameraClaims.uid ===
+    // requestAuthUid) only proves ACCOUNT-level ownership -- the same Google account can be
+    // signed into more than one Home installation, each with its own registeredDevices document
+    // and Keystore key, and nothing checked so far proves THIS specific verified `deviceId` (not
+    // just "some Home device this account owns") is the installation that actually claimed this
+    // Camera. users/{claimOwnerUid}/cameraDevices/{cameraDeviceId}.homeDeviceId is the existing
+    // canonical record of exactly that: written exactly once, only by claimCameraForUser, at the
+    // moment a specific Home installation genuinely claimed this camera -- function-only-writable
+    // (firestore.rules: `allow write: if false` on this subcollection; the client cannot forge or
+    // alter it directly), and never touched by any other code path except a full unpair (delete)
+    // followed by a fresh re-claim. A missing document (never claimed under this owner, or
+    // already unpaired) or a mismatched homeDeviceId both deny -- fail closed, no permissive
+    // default (unlike checkRegisteredDeviceOperational's own missing-document leniency, which is
+    // about operational STATUS, not identity/authorization). CAMERA's own device-level identity
+    // is already fully established above (CAMERA_TARGET_MISMATCH requires deviceId ===
+    // cameraDeviceId), so this lookup only runs for role === "HOME". No new Firestore collection:
+    // this reuses the existing users/{uid}/cameraDevices/{cameraDeviceId} document
+    // claimCameraForUser (index.ts) already writes.
+    if (role === "HOME") {
+      const homeCameraLinkRef = db
+        .collection("users")
+        .doc(claimOwnerUid)
+        .collection("cameraDevices")
+        .doc(cameraDeviceId);
+      const homeCameraLinkSnap = await t.get(homeCameraLinkRef);
+      const linkedHomeDeviceId = homeCameraLinkSnap.exists
+        ? (homeCameraLinkSnap.get("homeDeviceId") as string | undefined)
+        : undefined;
+      if (!linkedHomeDeviceId || linkedHomeDeviceId !== deviceId) {
+        return { outcome: "denied", reason: "HOME_CAMERA_LINK_MISMATCH" };
+      }
     }
 
     // Atomic consumption -- only reached once every check above has passed.
