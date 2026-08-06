@@ -93,10 +93,36 @@ async function seedPairingSession(pairingId, cameraDeviceId, cameraAuthUid, pair
   });
 }
 
+// claimCameraForUser now requires the Home to already be canonically registered (see the legacy
+// registerLegacyHome bypass fix) -- it no longer lazily creates a HOME registeredDevices document
+// itself. Every claim attempt in this file needs its Home pre-registered exactly as
+// registerDevicePublicKey's own HOME-bootstrap would have left it, or the claim is rejected before
+// ever reaching any of the canonical-entitlements logic this file actually tests.
+async function seedHomeRegistration(homeDeviceId, ownerUid) {
+  const now = admin.firestore.Timestamp.now();
+  await registryRef(homeDeviceId).set({
+    schemaVersion: 1,
+    deviceId: homeDeviceId,
+    role: "HOME",
+    authUid: ownerUid,
+    ownerUid,
+    status: "active",
+    suspensionReason: null,
+    identityMode: "keystore",
+    publicKey: "ecs-test-home-public-key",
+    createdAt: now,
+    updatedAt: now,
+    lastSeenAt: now,
+    revokedAt: null,
+    deviceProofVersion: null,
+  });
+}
+
 // A fresh {ownerUid, homeDeviceId, cameraDeviceId, cameraAuthUid, pairingId, pairingSecret}
-// quadruple with a ready-to-consume pairing session -- every id is unique per call so tests never
-// share Firestore state (this file's helpers never reset users/{uid}.cameraCount between tests,
-// same reason deviceRegistry.test.js's own "idempotent claim" test uses a dedicated uid).
+// quadruple with a ready-to-consume pairing session and an already-registered Home -- every id is
+// unique per call so tests never share Firestore state (this file's helpers never reset
+// users/{uid}.cameraCount between tests, same reason deviceRegistry.test.js's own "idempotent
+// claim" test uses a dedicated uid).
 async function setupClaimAttempt(overrides = {}) {
   const ownerUid = overrides.ownerUid ?? uniqueId("ecs-owner");
   const cameraDeviceId = overrides.cameraDeviceId ?? uniqueId("ecs-camera");
@@ -104,7 +130,10 @@ async function setupClaimAttempt(overrides = {}) {
   const cameraAuthUid = overrides.cameraAuthUid ?? uniqueId("ecs-camera-auth");
   const pairingId = uniqueId("ecs-pairing");
   const pairingSecret = uniqueId("ecs-secret");
-  await seedPairingSession(pairingId, cameraDeviceId, cameraAuthUid, pairingSecret);
+  await Promise.all([
+    seedPairingSession(pairingId, cameraDeviceId, cameraAuthUid, pairingSecret),
+    seedHomeRegistration(homeDeviceId, ownerUid),
+  ]);
   return { ownerUid, cameraDeviceId, homeDeviceId, cameraAuthUid, pairingId, pairingSecret };
 }
 
@@ -253,16 +282,16 @@ test("no legacy fallback: canonical turnAccessAllowed=false is never replaced by
 // tests above)
 // ---------------------------------------------------------------------------------------------
 
-test("production consumers: Home registration / Camera registration have no synchronous entitlement-gated limit today (N/A)", () => {
-  // registerLegacyHome/registerLegacyCamera/attachCameraOwner/registerDevicePublicKey (all in
-  // deviceRegistry.ts) never read cameraLimit/subscriptionUnits/userEntitlements at all -- there
-  // is no synchronous Home-count or "Camera registration" entitlement gate in this codebase to
-  // convert; the only Home-count enforcement is the best-effort reconcile pass
-  // (reconcileDevicesOnEntitlementChange/reconcileUserDeviceLimits), which already reads
-  // maxHomeDevices from canonical userEntitlements and has never had a legacy source (see
-  // entitlements.test.js's own planDeviceLimitsFromEntitlementsData tests). Transactional Home/
-  // Camera limit enforcement beyond claimCameraForUser's existing Camera-count check is explicitly
-  // out of scope for this task.
+test("production consumers: Home registration is now transactionally maxHomeDevices-gated (superseded, kept as a pointer)", () => {
+  // Superseded by two later tasks: registerDevicePublicKey's own HOME-bootstrap branch (in
+  // applyPublicKeyRegistration) now enforces maxHomeDevices transactionally -- see
+  // transactionalDeviceLimits.test.js's "Home basic/concurrency" sections for the actual coverage.
+  // registerLegacyCamera/attachCameraOwner still never read entitlements (Camera registration
+  // itself is never limit-gated, only claimCameraForUser's own claim is). registerLegacyHome no
+  // longer creates a document at all (the legacy-bypass fix) -- claimCameraForUser now requires
+  // the Home to already be canonically registered before a claim can even start, so the only path
+  // that ever allocates a new Home slot is registerDevicePublicKey's own transaction. See
+  // transactionalDeviceLimits.test.js's "REGRESSION: legacy bypass" section for that coverage.
   assert.ok(true);
 });
 

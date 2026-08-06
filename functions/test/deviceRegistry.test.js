@@ -127,15 +127,37 @@ test("registerLegacyCamera creates a new legacy CAMERA with ownerUid null, statu
   assert.ok(data.lastSeenAt);
 });
 
-// --- 3. HOME is created with authUid/ownerUid from the authenticated request -------------------
+// --- registerLegacyHome never creates a new HOME device (bypass fix) ---------------------------
+// A brand-new HOME must always go through the canonical registerDevicePublicKey flow first, whose
+// own transaction enforces maxHomeDevices -- see claimCameraForUser's own requireRegistered check,
+// which now rejects a claim before registerLegacyHome could ever run against an unregistered Home.
 
-test("registerLegacyHome creates a HOME device with authUid == ownerUid == the given uid", async () => {
+test("registerLegacyHome never creates a registeredDevices document for a Home that was never registered", async () => {
+  await registerLegacyHome(db, HOME_DEVICE_ID, OWNER_UID);
+
+  assert.equal((await registryRef(HOME_DEVICE_ID).get()).exists, false);
+});
+
+test("registerLegacyHome touches lastSeenAt/updatedAt on an already-registered HOME without changing identity", async () => {
+  await seedRegisteredDevice(HOME_DEVICE_ID, { role: "HOME", authUid: OWNER_UID, ownerUid: OWNER_UID });
+  const before = (await registryRef(HOME_DEVICE_ID).get()).data();
+
+  await registerLegacyHome(db, HOME_DEVICE_ID, OWNER_UID);
+
+  const after = (await registryRef(HOME_DEVICE_ID).get()).data();
+  assert.equal(after.role, "HOME");
+  assert.equal(after.authUid, OWNER_UID);
+  assert.equal(after.ownerUid, OWNER_UID);
+  assert.equal(after.createdAt.isEqual(before.createdAt), true);
+});
+
+test("registerLegacyHome does not overwrite an existing device whose identity conflicts (e.g. a CAMERA sharing the same id)", async () => {
+  await registerLegacyCamera(db, HOME_DEVICE_ID, CAMERA_AUTH_UID);
+
   await registerLegacyHome(db, HOME_DEVICE_ID, OWNER_UID);
 
   const data = (await registryRef(HOME_DEVICE_ID).get()).data();
-  assert.equal(data.role, "HOME");
-  assert.equal(data.authUid, OWNER_UID);
-  assert.equal(data.ownerUid, OWNER_UID);
+  assert.equal(data.role, "CAMERA", "an identity conflict must never be silently overwritten");
 });
 
 // --- attachCameraOwner on a fresh device creates it with the given ownerUid --------------------
@@ -408,6 +430,9 @@ test.afterEach(async () => {
 test("2. claimCameraForUser attaches the correct ownerUid to the CAMERA device", async () => {
   const pairingId = "pairing-claim-test-1";
   await seedValidPairingSession(pairingId, "s3cr3t-1");
+  // HOME must already be canonically registered (registerDevicePublicKey's own job) before a claim
+  // can complete -- claimCameraForUser no longer lazily creates it. See the legacy-bypass fix.
+  await seedRegisteredDevice(HOME_DEVICE_ID, { role: "HOME", authUid: OWNER_UID, ownerUid: OWNER_UID });
 
   await claimCameraForUser.run(
     fakeRequest(
@@ -455,6 +480,11 @@ test("21. a repeated (idempotent) claim by the same owner does not create a dupl
   // (e.g. the Home App retrying after an ambiguous network response to the first attempt).
   const pairingId1 = "pairing-claim-test-2a";
   await seedValidPairingSession(pairingId1, "s3cr3t-2a");
+  await seedRegisteredDevice(HOME_DEVICE_ID, {
+    role: "HOME",
+    authUid: IDEMPOTENT_CLAIM_OWNER_UID,
+    ownerUid: IDEMPOTENT_CLAIM_OWNER_UID,
+  });
 
   // 1. First successful claim.
   const firstResponse = await claimCameraForUser.run(

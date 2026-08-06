@@ -408,14 +408,16 @@ export const claimCameraForUser = onCall(
     const secretHash = hashSecret(pairingSecret);
 
     const registryRef = db.collection("registeredDevices").doc(cameraDeviceId);
+    const homeRegistryRef = db.collection("registeredDevices").doc(homeDeviceId);
     const entitlementsRef = db.collection("userEntitlements").doc(uid);
 
     const txResult = await db.runTransaction(async (t) => {
-      const [userSnap, claimSnap, pairingSnap, registrySnap, entitlementsSnap] = await Promise.all([
+      const [userSnap, claimSnap, pairingSnap, registrySnap, homeRegistrySnap, entitlementsSnap] = await Promise.all([
         t.get(userRef),
         t.get(claimRef),
         t.get(pairingRef),
         t.get(registryRef),
+        t.get(homeRegistryRef),
         t.get(entitlementsRef),
       ]);
 
@@ -459,6 +461,66 @@ export const claimCameraForUser = onCall(
           operational.reason === "DEVICE_NOT_REGISTERED" ? "not-found" : "failed-precondition",
           operational.reason
         );
+      }
+
+      // A Camera claim may only ever complete for a Home that (a) has already gone through the
+      // canonical registerDevicePublicKey flow -- that flow's own transaction (see
+      // applyPublicKeyRegistration) is the one and only place a new HOME device's maxHomeDevices
+      // limit is enforced -- and (b) canonically belongs to the caller (`uid`) as its own,
+      // self-registered HOME device. checkRegisteredDeviceOperational alone only inspects
+      // status/suspensionReason -- it never checks role or identity -- so it is deliberately NOT
+      // used on its own here: a registeredDevices/{homeDeviceId} document that happens to exist
+      // with an "active" status, but is actually a CAMERA-role document, or a HOME belonging to a
+      // different uid, or an identity-conflicting leftover, must never let a claim through just
+      // because *some* document exists at that id.
+      //
+      // role/authUid/ownerUid are the canonical identity fields written once, atomically, by
+      // registerDevicePublicKey's own transaction (authUid = ownerUid = the registering uid,
+      // HOME is always self-owned -- see applyPublicKeyRegistration's bootstrap write) and never
+      // client-suppliable afterward (upsertRegisteredDevice/registerLegacyHome never let a later
+      // call silently change authUid, and only ever set ownerUid on first creation for HOME). All
+      // three are checked together, in one boolean, so a mismatch on any of them collapses to the
+      // exact same outcome and the exact same public reason as "not registered at all" --
+      // deliberately never distinguishing "registered to someone else" / "wrong role" / "identity
+      // conflict" from "missing", so this can never be used as an oracle to probe for another
+      // user's device id, role, or ownership.
+      //
+      // Read inside this same transaction, strictly before any write below, so a claim can never
+      // commit (Camera claimed, pairing consumed) while leaving an unregistered, wrongly-owned, or
+      // wrong-role Home to be lazily accepted.
+      const homeRegistryExisting = homeRegistrySnap.exists ? (homeRegistrySnap.data() as RegisteredDevice) : null;
+      const homeBelongsToCaller =
+        homeRegistryExisting !== null &&
+        homeRegistryExisting.role === "HOME" &&
+        homeRegistryExisting.authUid === uid &&
+        homeRegistryExisting.ownerUid === uid;
+      if (!homeBelongsToCaller) {
+        // No identifiers (cameraDeviceId/homeDeviceId/uid/ownerUid/authUid) or Firestore paths --
+        // only safe, non-identifying fields, matching this task's own stricter logging contract
+        // for newly-added log lines.
+        logger.info("CLAIM_CAMERA_HOME_DEVICE_STATUS_DENIED", {
+          operation: "claimCameraForUser",
+          role: "HOME",
+          stage: "home_precondition",
+          result: "denied",
+          reason: "DEVICE_NOT_REGISTERED",
+        });
+        throw new HttpsError("not-found", "DEVICE_NOT_REGISTERED");
+      }
+
+      // Only reached for a Home already confirmed to canonically belong to this caller -- safe to
+      // reveal its own suspended/revoked status (it is the caller's own device, not someone
+      // else's).
+      const homeOperational = checkRegisteredDeviceOperational(homeRegistryExisting);
+      if (!homeOperational.operational) {
+        logger.info("CLAIM_CAMERA_HOME_DEVICE_STATUS_DENIED", {
+          operation: "claimCameraForUser",
+          role: "HOME",
+          stage: "home_precondition",
+          result: "denied",
+          reason: homeOperational.reason,
+        });
+        throw new HttpsError("failed-precondition", homeOperational.reason);
       }
 
       // Idempotent: already claimed by this user
@@ -602,10 +664,14 @@ export const claimCameraForUser = onCall(
     // Best-effort device-registry bookkeeping (see deviceRegistry.ts), run only after the claim
     // transaction above has already committed -- Firestore does not support nesting one
     // transaction inside another, and registerLegacyHome()/attachCameraOwner() each run their own.
-    // Never blocks or changes this function's response. homeDeviceId's authUid/ownerUid are taken
-    // from the already-authenticated request (`uid`), never trusted from the client as-is beyond
-    // that. `cameraAuthUid` is the Camera's own auth uid as already verified by the pairing
-    // session validated inside the transaction above -- never `uid` (the Home caller).
+    // Never blocks or changes this function's response. registerLegacyHome() itself never creates
+    // a document (see its own doc) -- the transaction above already required the Home to be
+    // registered and operational before it would even commit, so this is purely a lastSeenAt
+    // touch on the Home's already-existing, already-limit-checked registeredDevices document.
+    // homeDeviceId's authUid/ownerUid are taken from the already-authenticated request (`uid`),
+    // never trusted from the client as-is beyond that. `cameraAuthUid` is the Camera's own auth
+    // uid as already verified by the pairing session validated inside the transaction above --
+    // never `uid` (the Home caller).
     await registerLegacyHome(db, homeDeviceId, uid);
     if (txResult.cameraAuthUid) {
       await attachCameraOwner(db, cameraDeviceId, txResult.cameraAuthUid, uid);
@@ -1659,6 +1725,17 @@ export const registerDevicePublicKey = onCall(
           authTimeCategory: result.reason,
         });
         throw new HttpsError("failed-precondition", "RECENT_AUTH_REQUIRED");
+      case "home_limit_reached":
+        // Mirrors claimCameraForUser's own CAMERA_LIMIT_REACHED (resource-exhausted) -- the
+        // analogous Home-specific reason, distinguished from Camera's own, per this project's
+        // existing convention of keeping the two limits separately named. Never reveals the
+        // actual count or limit to the client (unlike CAMERA_LIMIT_REACHED's own `details`
+        // object, a pre-existing choice this task does not change). Deliberately omits
+        // deviceId/uid from this specific new log line (unlike this switch's other, pre-existing
+        // cases) -- this task's own stricter logging contract for newly-added lines only allows
+        // operation/role/stage/result/reason, never an identifier.
+        logger.info("REGISTER_DEVICE_PUBLIC_KEY_DENIED", { role, reason: "HOME_DEVICE_LIMIT_REACHED" });
+        throw new HttpsError("resource-exhausted", "HOME_DEVICE_LIMIT_REACHED");
       default:
         throw new HttpsError("internal", "INTERNAL");
     }

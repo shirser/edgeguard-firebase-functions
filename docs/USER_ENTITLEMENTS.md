@@ -15,18 +15,33 @@ This document covers the entitlements model itself. It does **not** cover
 - a concurrent Live View session limit
 - rate limiting
 
-Today, `turnAccessAllowed` (in `getTurnCredentials`, see below) and
-`maxCameras` (in `claimCameraForUser`'s existing, non-transactional-limit
-camera-count check) are enforced. `maxHomeDevices` and
-`maxConcurrentLiveSessions` are stored and resolved, but nothing checks them
-synchronously yet — `maxHomeDevices` is only applied by the best-effort
-reconcile pass (`reconcileDevicesOnEntitlementChange` /
-`reconcileUserDeviceLimits`, deviceRegistry.ts), and
-`maxConcurrentLiveSessions` requires server-side Live View session tracking
-listed above. The legacy `users/{uid}.cameraLimit`/`subscriptionUnits`
-fields are no longer read for any of these decisions — `cameraLimit` is
-still written back as an inert compatibility mirror, always populated from
-this canonical `maxCameras`, never the other way around.
+Today, `turnAccessAllowed` (in `getTurnCredentials`, see below), `maxCameras`
+(in `claimCameraForUser`'s own `db.runTransaction`), and `maxHomeDevices`
+(in `registerDevicePublicKey`'s HOME-bootstrap branch, inside
+`applyPublicKeyRegistration`'s own `db.runTransaction`) are enforced. Both
+Camera and Home enforcement read the canonical entitlement document, the
+canonical current count, and perform the allocation write inside the same
+Firestore transaction, so a limit can never be exceeded by two concurrent
+requests racing each other. `registerDevicePublicKey` is the **only** path
+that can ever allocate a brand-new HOME device: `claimCameraForUser` used to
+be able to lazily create one after its own transaction committed (via
+`registerLegacyHome`), entirely bypassing this limit — that path has been
+closed. `registerLegacyHome` no longer creates a document under any
+circumstance, and `claimCameraForUser`'s own transaction now requires the
+Home to already be registered and operational (reusing the existing
+`DEVICE_NOT_REGISTERED` reason) before it does anything else, so a claim can
+never commit while leaving an unregistered Home to be created afterward.
+`maxConcurrentLiveSessions` is stored and
+resolved, but nothing checks it synchronously yet — it requires server-side
+Live View session tracking, listed above. The best-effort reconcile pass
+(`reconcileDevicesOnEntitlementChange` / `reconcileUserDeviceLimits`,
+deviceRegistry.ts) remains as downgrade/repair defense-in-depth (e.g. when a
+plan's limit drops below a user's existing device count) but is no longer
+the sole protection against exceeding `maxCameras`/`maxHomeDevices` at new
+claim/registration time. The legacy `users/{uid}.cameraLimit`/
+`subscriptionUnits` fields are no longer read for any of these decisions —
+`cameraLimit` is still written back as an inert compatibility mirror, always
+populated from this canonical `maxCameras`, never the other way around.
 
 ## Firestore document
 
@@ -54,7 +69,7 @@ entitlements through what server-side callables allow or deny.
 | `plan` | `"free" \| "premium" \| "custom"` | Which plan this grant represents. `"custom"` is for a manually-tuned grant that doesn't fit the free/premium numbers. |
 | `subscriptionStatus` | `"active" \| "expired" \| "blocked"` | Whether the grant is currently in effect, has lapsed, or the user has been explicitly blocked. |
 | `maxCameras` | non-negative integer | Camera limit. Not yet enforced anywhere. |
-| `maxHomeDevices` | non-negative integer | Home device limit. Not yet enforced anywhere. |
+| `maxHomeDevices` | non-negative integer | Home device limit. Enforced today in `registerDevicePublicKey`'s HOME-bootstrap path. |
 | `maxConcurrentLiveSessions` | non-negative integer | Concurrent Live View session limit. Not yet enforced anywhere. |
 | `turnAccessAllowed` | boolean | Whether this user may obtain TURN credentials at all. Enforced today in `getTurnCredentials`. |
 | `source` | `"default" \| "manual" \| "promo" \| "google_play"` | Where this grant came from — bookkeeping/audit only, never used to change behavior. |
@@ -170,12 +185,12 @@ before issuing TURN credentials. The client only ever sees the generic
 `permission-denied` / `TURN_ACCESS_DENIED` error — never the internal reason
 (plan, blocked status, expiry, or any other document detail).
 
-`maxHomeDevices` and `maxConcurrentLiveSessions` are **not** checked
-synchronously here or anywhere else yet (`maxHomeDevices` is only enforced
-by the best-effort reconcile pass; `maxConcurrentLiveSessions` needs
-server-side Live View session tracking). `maxCameras` is enforced
-separately, in `claimCameraForUser` (see its own transaction) -- not part of
-this callable.
+`maxConcurrentLiveSessions` is **not** checked synchronously here or
+anywhere else yet — it needs server-side Live View session tracking.
+`maxCameras` is enforced separately, in `claimCameraForUser` (see its own
+transaction), and `maxHomeDevices` is enforced separately again, in
+`registerDevicePublicKey`'s HOME-bootstrap branch (see its own transaction
+in `applyPublicKeyRegistration`) — neither is part of this callable.
 
 ## Example documents
 

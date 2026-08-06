@@ -2,6 +2,7 @@ import * as admin from "firebase-admin";
 import * as logger from "firebase-functions/logger";
 import * as crypto from "crypto";
 import type { DeviceLimits } from "./entitlements";
+import { planDeviceLimitsFromEntitlementsData } from "./entitlements";
 
 // Stage 1 of the EdgeGuard device registry: a single global, Admin-SDK-only collection that
 // records every known Camera/Home installation ("device") independently of cameraClaims/
@@ -112,12 +113,13 @@ function logWriteFailed(eventName: string, deviceId: string, role: DeviceRole | 
   });
 }
 
-// Shared upsert core for registerLegacyCamera/registerLegacyHome/attachCameraOwner -- the three
-// operations that assert "this deviceId is a <role> device authenticated as <authUid>" and differ
-// only in what ownerUid should be on first creation, and whether an *existing* document's
-// ownerUid should also be updated (attachCameraOwner: yes: everyone else: no, so a later call
-// can never silently reset an already-attached owner back to whatever this call's own intent
-// was).
+// Shared upsert core for registerLegacyCamera/attachCameraOwner -- the two operations that assert
+// "this deviceId is a <role> device authenticated as <authUid>" and are still allowed to create a
+// brand-new document, differing only in what ownerUid should be on first creation, and whether an
+// *existing* document's ownerUid should also be updated (attachCameraOwner: yes: registerLegacyCamera:
+// no, so a later call can never silently reset an already-attached owner back to whatever this
+// call's own intent was). registerLegacyHome deliberately does NOT use this helper -- see its own
+// doc for why it must never create a document.
 //
 // Never throws: every Firestore/logic error is caught and logged, and the caller-visible response
 // this module is invoked from (createCameraPairingSession/claimCameraForUser/getTurnCredentials/
@@ -198,21 +200,50 @@ export async function registerLegacyCamera(
   );
 }
 
-// Registers a Home installation -- called from claimCameraForUser right after a claim succeeds
-// (the first point at which the Home App is both authenticated and actively participating in a
-// server-verified flow). A HOME device's ownerUid is always its own authUid (self-owned); there
-// is no separate "attach/detach owner" concept for HOME, since HOME's authUid is itself already
-// identity-protected by upsertRegisteredDevice's conflict check.
+// Post-commit compatibility touch for a Home installation -- called from claimCameraForUser right
+// after a claim succeeds. Deliberately NEVER creates a new registeredDevices document (unlike
+// registerLegacyCamera/attachCameraOwner, which still may): a brand-new HOME device must always go
+// through the canonical registerDevicePublicKey flow first, whose own transaction is the one and
+// only place a Home's maxHomeDevices limit is enforced (see applyPublicKeyRegistration). If this
+// function were still allowed to create a document, it would let a HOME device claim a Camera
+// (and thereby get itself registered) without ever passing that check -- claimCameraForUser's own
+// transaction now requires the Home to already be registered and operational before it commits
+// anything (see its own checkRegisteredDeviceOperational({ requireRegistered: true }) call), so in
+// practice this function only ever runs against an already-existing, already-limit-checked
+// document. Kept as a safe no-op on a missing document (rather than asserting) so this function
+// can never itself become a way to bypass the limit, even if called from somewhere new later.
 export async function registerLegacyHome(
   db: admin.firestore.Firestore,
   homeDeviceId: string,
   authUid: string
 ): Promise<void> {
-  await upsertRegisteredDevice(
-    db,
-    { deviceId: homeDeviceId, role: "HOME", authUid, ownerUid: authUid },
-    { eventPrefix: "DEVICE_REGISTRY_REGISTER_LEGACY_HOME", setOwnerOnExisting: false }
-  );
+  const ref = registeredDeviceRef(db, homeDeviceId);
+  try {
+    await db.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      if (!snap.exists) {
+        return;
+      }
+
+      const existing = snap.data() as RegisteredDevice;
+      const conflict = identityConflictReason(existing, { deviceId: homeDeviceId, role: "HOME", authUid });
+      if (conflict) {
+        logIdentityConflict("DEVICE_REGISTRY_REGISTER_LEGACY_HOME_IDENTITY_CONFLICT", homeDeviceId, "HOME", conflict);
+        return;
+      }
+
+      t.set(
+        ref,
+        {
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    });
+  } catch (error) {
+    logWriteFailed("DEVICE_REGISTRY_REGISTER_LEGACY_HOME_WRITE_FAILED", homeDeviceId, "HOME", error);
+  }
 }
 
 // Sets (or creates-with) a Camera's ownerUid -- called both from claimCameraForUser right after a
@@ -491,7 +522,8 @@ export type PublicKeyRegistrationOutcome =
   | { outcome: "revoked" }
   | { outcome: "key_conflict" }
   | { outcome: "corrupt" }
-  | { outcome: "recent_auth_required"; reason: AuthTimeFreshnessReason };
+  | { outcome: "recent_auth_required"; reason: AuthTimeFreshnessReason }
+  | { outcome: "home_limit_reached" };
 
 // Same shape as PublicKeyRegistrationOutcome, but the two outcomes that require a write
 // (idempotent/registered) also carry the exact fields to write -- kept internal (not exported)
@@ -681,6 +713,44 @@ export async function applyPublicKeyRegistration(
       const freshness = checkAuthTimeFreshness(params.authTime, params.nowSeconds);
       if (!freshness.fresh) {
         return { outcome: "recent_auth_required", reason: freshness.reason };
+      }
+
+      // Canonical Home-slot limit check -- this is the one and only place a brand-new HOME
+      // registeredDevices document gets created (an existing document never re-enters this
+      // branch), so this is where a new slot is actually allocated. Both reads below happen
+      // inside this same transaction, strictly before the write further down, so this decision
+      // is atomic with the allocation itself -- two concurrent bootstrap calls for two different
+      // homeDeviceIds under the same owner can never both observe a free slot and both succeed
+      // (Firestore detects the conflicting write/query-result change and retries the loser).
+      //
+      // userEntitlements/{uid} is the sole canonical entitlement source (see entitlements.ts) --
+      // resolved via the same pure, already-tested resolver every other consumer uses
+      // (planDeviceLimitsFromEntitlementsData), never legacy users/{uid}.cameraLimit/
+      // subscriptionUnits, and never a second, divergent copy of the resolution rules.
+      //
+      // The Home count itself is read from registeredDevices via `where("ownerUid", "==", ...)`
+      // -- the exact same canonical, single-equality (no composite index needed) query
+      // reconcileUserDeviceLimits already treats as authoritative -- then filtered in memory to
+      // role === "HOME" and status !== "revoked" (a revoked device still occupies its slot until
+      // an explicit release path frees it; there is no Home release path today -- see this
+      // task's own report). This is a query read, not a fixed set of document reads, but
+      // Firestore transactions still correctly detect a concurrent write that would change the
+      // query's result set and retry accordingly -- proven directly by this file's own
+      // concurrency tests, not merely assumed.
+      const homeSlotOwnerUid = params.expectedOwnerUid ?? params.expectedAuthUid;
+      const [entitlementsSnap, homeDevicesSnap] = await Promise.all([
+        t.get(db.collection("userEntitlements").doc(homeSlotOwnerUid)),
+        t.get(db.collection(REGISTERED_DEVICES_COLLECTION).where("ownerUid", "==", homeSlotOwnerUid)),
+      ]);
+      const deviceLimits = planDeviceLimitsFromEntitlementsData(
+        entitlementsSnap.exists ? entitlementsSnap.data() : undefined
+      );
+      const currentHomeCount = homeDevicesSnap.docs.filter((d) => {
+        const data = d.data() as RegisteredDevice;
+        return data.role === "HOME" && data.status !== "revoked";
+      }).length;
+      if (currentHomeCount >= deviceLimits.maxHomeDevices) {
+        return { outcome: "home_limit_reached" };
       }
 
       // Validation (deviceId/role/algorithm/Base64/SPKI DER/EC/P-256/canonical Base64) has
