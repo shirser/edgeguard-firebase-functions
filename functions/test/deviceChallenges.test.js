@@ -571,8 +571,11 @@ test("createDeviceChallenge: two sequential calls produce different challengeId 
 // Pure-function coverage for the closed types themselves (supports 1-19 above)
 // ---------------------------------------------------------------------------------------------
 
-test("isDeviceChallengePurpose: only TURN_CREDENTIALS is accepted", () => {
+test("isDeviceChallengePurpose: TURN_CREDENTIALS and the three LIVE_VIEW_* purposes are accepted, nothing else", () => {
   assert.equal(isDeviceChallengePurpose(DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS), true);
+  assert.equal(isDeviceChallengePurpose(DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_START), true);
+  assert.equal(isDeviceChallengePurpose(DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_RENEW), true);
+  assert.equal(isDeviceChallengePurpose(DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_END), true);
   assert.equal(isDeviceChallengePurpose("LIVE_VIEW_SESSION_CREATE"), false);
   assert.equal(isDeviceChallengePurpose(""), false);
   assert.equal(isDeviceChallengePurpose(undefined), false);

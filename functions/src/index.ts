@@ -19,12 +19,16 @@ import {
   checkRegisteredDeviceOperational,
   reconcileUserDeviceLimits,
 } from "./deviceRegistry";
-import type { PublicKeyRegistrationOutcome, RegisteredDevice, RevokeDeviceDecision } from "./deviceRegistry";
+import type { DeviceRole, PublicKeyRegistrationOutcome, RegisteredDevice, RevokeDeviceDecision } from "./deviceRegistry";
 import {
   DEVICE_CHALLENGE_PURPOSES,
   isDeviceChallengePurpose,
   validateTurnCredentialsRequestPayload,
   buildCanonicalTurnCredentialsRequestPayload,
+  validateLiveViewStartRequestPayload,
+  buildCanonicalLiveViewStartRequestPayload,
+  validateLiveViewSessionIdRequestPayload,
+  buildCanonicalLiveViewSessionIdRequestPayload,
   sha256Hex,
   buildCanonicalDeviceProofPayload,
   generateChallengeNonce,
@@ -103,6 +107,12 @@ export {
   isDeviceChallengePurpose,
   validateTurnCredentialsRequestPayload,
   buildCanonicalTurnCredentialsRequestPayload,
+  validateLiveViewStartRequestPayload,
+  buildCanonicalLiveViewStartRequestPayload,
+  validateLiveViewSessionIdRequestPayload,
+  buildCanonicalLiveViewSessionIdRequestPayload,
+  isValidLiveViewSessionIdFormat,
+  LIVE_VIEW_SESSION_ID_LENGTH,
   sha256Hex,
   buildCanonicalDeviceProofPayload,
   generateChallengeNonce,
@@ -119,6 +129,9 @@ export {
   validateTurnCredentialsDeviceProof,
   verifyDeviceProofSignature,
   consumeVerifiedTurnCredentialsChallenge,
+  verifyDeviceChallengeForConsumption,
+  isValidChallengeNonceFormat,
+  isValidChallengeRequestHashFormat,
 } from "./deviceChallenges";
 export type {
   DeviceChallengePurpose,
@@ -126,6 +139,10 @@ export type {
   TurnCredentialsChallengeRequestPayload,
   RequestPayloadInvalidReason,
   TurnCredentialsRequestPayloadValidation,
+  LiveViewStartChallengeRequestPayload,
+  LiveViewStartRequestPayloadValidation,
+  LiveViewSessionIdChallengeRequestPayload,
+  LiveViewSessionIdRequestPayloadValidation,
   DeviceChallengeEligibilityReason,
   DeviceChallengeEligibilityDecision,
   CanonicalDeviceProofFields,
@@ -137,8 +154,37 @@ export type {
   SignatureBase64Validation,
   TurnCredentialsChallengeVerificationFailureReason,
   TurnCredentialsChallengeConsumptionOutcome,
+  VerifiedDeviceChallenge,
+  DeviceChallengeVerificationResult,
 } from "./deviceChallenges";
 export { effectiveUserEntitlementsFromData } from "./entitlements";
+
+export {
+  LIVE_VIEW_SESSION_SCHEMA_VERSION,
+  LIVE_VIEW_USER_STATE_SCHEMA_VERSION,
+  LIVE_VIEW_LEASE_TTL_MS,
+  LIVE_VIEW_ALLOCATOR_MAX_ENTRIES,
+  parseLiveViewSession,
+  validateAllocatorEntryAgainstSession,
+  executeStartLiveViewSession,
+  executeRenewLiveViewSession,
+  executeEndLiveViewSession,
+  runLiveViewTransaction,
+  isEmulatorTransactionInvalidError,
+  EMULATOR_TRANSACTION_INVALID_MESSAGE,
+  MAX_EMULATOR_TRANSACTION_RETRY_ATTEMPTS,
+} from "./liveViewSessions";
+export type {
+  LiveViewSessionStatus,
+  LiveViewSession,
+  LiveViewUserStateActiveEntry,
+  LiveViewUserState,
+  LiveViewSessionDenialReason,
+  SessionParseResult,
+  StartLiveViewSessionOutcome,
+  RenewLiveViewSessionOutcome,
+  EndLiveViewSessionOutcome,
+} from "./liveViewSessions";
 
 function hashSecret(secret: string): string {
   return crypto.createHash("sha256").update(secret).digest("hex");
@@ -1789,91 +1835,219 @@ export const createDeviceChallenge = onCall(
       throw new HttpsError("invalid-argument", "INVALID_PURPOSE");
     }
 
-    logger.info("DEVICE_CHALLENGE_CREATE_START", { deviceId, purpose });
-
-    // Only TURN_CREDENTIALS exists today -- isDeviceChallengePurpose already narrows `purpose` to
-    // the single member of DeviceChallengePurpose. Written as a purpose-specific branch anyway so
-    // a second purpose can be added later without restructuring this function.
-    const payloadValidation = validateTurnCredentialsRequestPayload(requestPayload);
-    if (!payloadValidation.valid) {
-      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, purpose, reason: payloadValidation.reason });
-      throw new HttpsError("invalid-argument", "INVALID_REQUEST_PAYLOAD");
+    // deviceId is logged for TURN_CREDENTIALS only, preserving this line's pre-existing behavior
+    // exactly -- for the three LIVE_VIEW_* purposes it is a Home device id, and this task's own
+    // stricter Live View logging contract forbids it (see mapLiveViewSessionDenialToHttpsError's
+    // own doc in liveViewCallables.ts for the full list of fields never logged for these purposes).
+    if (purpose === DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS) {
+      logger.info("DEVICE_CHALLENGE_CREATE_START", { deviceId, purpose });
+    } else {
+      logger.info("DEVICE_CHALLENGE_CREATE_START", { operation: "createDeviceChallenge", purpose, stage: "start" });
     }
-    const turnRequestPayload = payloadValidation.payload;
-    const { cameraDeviceId, turnPurpose } = turnRequestPayload;
 
     const db = admin.firestore();
 
-    const deviceSnap = await db.collection("registeredDevices").doc(deviceId).get();
-    const existingDevice = deviceSnap.exists ? (deviceSnap.data() as RegisteredDevice) : null;
+    // role/canonicalRequestPayload/challengeLogFields are resolved by exactly one of the two
+    // branches below (TURN_CREDENTIALS vs. the three LIVE_VIEW_* purposes), then consumed by the
+    // single, shared challenge-assembly tail after this if/else -- challenge creation itself
+    // (nonce/expiresAt/challengeId/canonicalPayload/write) is purpose-agnostic and must only ever
+    // happen once, from one place, so a future purpose can never accidentally skip it.
+    let role: DeviceRole;
+    let canonicalRequestPayload: string;
+    // The exact fields logged on a successful creation -- kept purpose-specific here (rather than
+    // sharing one shape for every purpose) so TURN_CREDENTIALS' own existing, already-established
+    // logging (deviceId/cameraDeviceId/turnPurpose -- all treated as safe, non-personal identifiers
+    // by this codebase's own existing convention) stays completely unchanged, while the three new
+    // LIVE_VIEW_* purposes -- covered by this task's own stricter contract -- log only
+    // operation/role/purpose/stage/result, never deviceId/cameraDeviceId/sessionId/uid.
+    let successLogFields: Record<string, unknown>;
+    let writeFailureLogFields: Record<string, unknown>;
 
-    const eligibility = checkDeviceChallengeEligibility(existingDevice, authUid);
-    if (!eligibility.eligible) {
-      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
-        deviceId,
-        purpose,
-        cameraDeviceId,
-        turnPurpose,
-        reason: eligibility.reason,
-      });
-      if (eligibility.reason === "DEVICE_NOT_REGISTERED") {
-        throw new HttpsError("not-found", "DEVICE_NOT_REGISTERED");
+    if (purpose === DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS) {
+      // Only TURN_CREDENTIALS existed at this stage originally -- this branch is byte-for-byte the
+      // same checks, in the same order, as before the LIVE_VIEW_* purposes were added.
+      const payloadValidation = validateTurnCredentialsRequestPayload(requestPayload);
+      if (!payloadValidation.valid) {
+        logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, purpose, reason: payloadValidation.reason });
+        throw new HttpsError("invalid-argument", "INVALID_REQUEST_PAYLOAD");
       }
-      if (eligibility.reason === "AUTH_UID_MISMATCH") {
-        throw new HttpsError("permission-denied", "DEVICE_IDENTITY_MISMATCH");
-      }
-      throw new HttpsError("failed-precondition", eligibility.reason);
-    }
-    const role = eligibility.role;
+      const turnRequestPayload = payloadValidation.payload;
+      const { cameraDeviceId, turnPurpose } = turnRequestPayload;
 
-    // A CAMERA may only ever request a challenge about itself -- defense-in-depth on top of the
-    // cameraClaims cross-check below (which would already deny a mismatched camera identity via
-    // authUid uniqueness), making the invariant explicit rather than incidental.
-    if (role === "CAMERA" && deviceId !== cameraDeviceId) {
-      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
-        deviceId,
+      const deviceSnap = await db.collection("registeredDevices").doc(deviceId).get();
+      const existingDevice = deviceSnap.exists ? (deviceSnap.data() as RegisteredDevice) : null;
+
+      const eligibility = checkDeviceChallengeEligibility(existingDevice, authUid);
+      if (!eligibility.eligible) {
+        logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
+          deviceId,
+          purpose,
+          cameraDeviceId,
+          turnPurpose,
+          reason: eligibility.reason,
+        });
+        if (eligibility.reason === "DEVICE_NOT_REGISTERED") {
+          throw new HttpsError("not-found", "DEVICE_NOT_REGISTERED");
+        }
+        if (eligibility.reason === "AUTH_UID_MISMATCH") {
+          throw new HttpsError("permission-denied", "DEVICE_IDENTITY_MISMATCH");
+        }
+        throw new HttpsError("failed-precondition", eligibility.reason);
+      }
+      role = eligibility.role;
+
+      // A CAMERA may only ever request a challenge about itself -- defense-in-depth on top of the
+      // cameraClaims cross-check below (which would already deny a mismatched camera identity via
+      // authUid uniqueness), making the invariant explicit rather than incidental.
+      if (role === "CAMERA" && deviceId !== cameraDeviceId) {
+        logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
+          deviceId,
+          role,
+          purpose,
+          cameraDeviceId,
+          turnPurpose,
+          reason: "CAMERA_TARGET_MISMATCH",
+        });
+        throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+      }
+
+      // Same preliminary access checks getTurnCredentials itself already performs, reused directly
+      // rather than re-implemented -- see getVerifiedCameraClaim's own doc. getTurnCredentials will
+      // independently repeat its own checks immediately before actually vending credentials; this
+      // callable only ever issues a challenge, never TURN credentials.
+      const claim = await getVerifiedCameraClaim(db, cameraDeviceId, authUid);
+      if (claim.access === "not-found") {
+        logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "CAMERA_NOT_FOUND" });
+        throw new HttpsError("not-found", "CAMERA_NOT_FOUND");
+      }
+      if (claim.access === "denied") {
+        logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "PERMISSION_DENIED" });
+        throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+      }
+
+      // Device-status enforcement on the TARGET camera -- reused exactly as getTurnCredentials
+      // itself already applies it, unmodified. Throws its own already-safe HttpsError directly
+      // (and logs its own DEVICE_OPERATIONAL_CHECK_DENIED event) if the camera is suspended/revoked.
+      await assertRegisteredDeviceOperational(db, cameraDeviceId);
+
+      const entitlements = await getEffectiveUserEntitlements(authUid, db);
+      if (!entitlements.turnAccessAllowed) {
+        logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "TURN_ACCESS_DENIED" });
+        throw new HttpsError("permission-denied", "TURN_ACCESS_DENIED");
+      }
+
+      canonicalRequestPayload = buildCanonicalTurnCredentialsRequestPayload(turnRequestPayload);
+      successLogFields = { deviceId, role, purpose, cameraDeviceId, turnPurpose };
+      writeFailureLogFields = { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "CHALLENGE_WRITE_FAILED" };
+    } else {
+      // LIVE_VIEW_START / LIVE_VIEW_RENEW / LIVE_VIEW_END (liveViewSessions.ts) -- HOME-only.
+      // Deliberately does NOT verify Camera ownership, the Home<->Camera link, or entitlements
+      // here: those decisions can only ever be made correctly atomically with the actual
+      // start/renew/end transaction (see liveViewSessions.ts's own doc) -- pre-checking them here
+      // too would be a second, non-atomic, potentially-divergent copy of that same authorization
+      // logic. This callable's only job for these purposes is: is the requesting device a real,
+      // operational, keystore-provisioned HOME device, and does its request payload have the right
+      // shape -- the same device-eligibility bar every purpose already enforces.
+      let liveViewCanonicalPayload: string;
+      if (purpose === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_START) {
+        const payloadValidation = validateLiveViewStartRequestPayload(requestPayload);
+        if (!payloadValidation.valid) {
+          logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
+            operation: "createDeviceChallenge",
+            purpose,
+            stage: "payload",
+            result: "denied",
+            reason: payloadValidation.reason,
+          });
+          throw new HttpsError("invalid-argument", "INVALID_REQUEST_PAYLOAD");
+        }
+        liveViewCanonicalPayload = buildCanonicalLiveViewStartRequestPayload(payloadValidation.payload);
+      } else {
+        const payloadValidation = validateLiveViewSessionIdRequestPayload(requestPayload);
+        if (!payloadValidation.valid) {
+          logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
+            operation: "createDeviceChallenge",
+            purpose,
+            stage: "payload",
+            result: "denied",
+            reason: payloadValidation.reason,
+          });
+          throw new HttpsError("invalid-argument", "INVALID_REQUEST_PAYLOAD");
+        }
+        liveViewCanonicalPayload = buildCanonicalLiveViewSessionIdRequestPayload(purpose, payloadValidation.payload);
+      }
+
+      const deviceSnap = await db.collection("registeredDevices").doc(deviceId).get();
+      const existingDevice = deviceSnap.exists ? (deviceSnap.data() as RegisteredDevice) : null;
+
+      const eligibility = checkDeviceChallengeEligibility(existingDevice, authUid);
+      // LIVE_VIEW_END is the one purpose that must remain obtainable even for a suspended/revoked
+      // Home -- see liveViewSessions.ts's own doc on why ending an already-authorized session can
+      // never itself be the abuse this feature exists to prevent, and executeEndLiveViewSession's
+      // own deliberate choice to never enforce Home operational status. checkDeviceChallengeEligibility
+      // is shared with TURN_CREDENTIALS/LIVE_VIEW_START/LIVE_VIEW_RENEW (all of which must still be
+      // blocked for a suspended/revoked device) and is left completely unmodified -- this purpose
+      // alone treats a purely-operational-status failure (never identity/provisioning) as eligible
+      // anyway, using the already-fetched existingDevice's own role directly.
+      const isEndDespiteOperationalStatus =
+        purpose === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_END &&
+        !eligibility.eligible &&
+        (eligibility.reason === "DEVICE_SUSPENDED" ||
+          eligibility.reason === "DEVICE_SUSPENDED_PLAN" ||
+          eligibility.reason === "DEVICE_REVOKED");
+
+      if (!eligibility.eligible && !isEndDespiteOperationalStatus) {
+        logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
+          operation: "createDeviceChallenge",
+          purpose,
+          stage: "eligibility",
+          result: "denied",
+          reason: eligibility.reason,
+        });
+        if (eligibility.reason === "DEVICE_NOT_REGISTERED") {
+          throw new HttpsError("not-found", "DEVICE_NOT_REGISTERED");
+        }
+        if (eligibility.reason === "AUTH_UID_MISMATCH") {
+          throw new HttpsError("permission-denied", "DEVICE_IDENTITY_MISMATCH");
+        }
+        throw new HttpsError("failed-precondition", eligibility.reason);
+      }
+      role = eligibility.eligible ? eligibility.role : (existingDevice as RegisteredDevice).role;
+
+      // Live View sessions are always HOME-initiated -- a CAMERA may never request one of these
+      // three purposes about itself or anything else.
+      if (role !== "HOME") {
+        logger.info("DEVICE_CHALLENGE_CREATE_DENIED", {
+          operation: "createDeviceChallenge",
+          purpose,
+          role,
+          stage: "role",
+          result: "denied",
+          reason: "ROLE_NOT_HOME",
+        });
+        throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+      }
+
+      canonicalRequestPayload = liveViewCanonicalPayload;
+      successLogFields = { operation: "createDeviceChallenge", role, purpose, stage: "issue", result: "success" };
+      writeFailureLogFields = {
+        operation: "createDeviceChallenge",
         role,
         purpose,
-        cameraDeviceId,
-        turnPurpose,
-        reason: "CAMERA_TARGET_MISMATCH",
-      });
-      throw new HttpsError("permission-denied", "PERMISSION_DENIED");
+        stage: "issue",
+        result: "denied",
+        reason: "CHALLENGE_WRITE_FAILED",
+      };
     }
 
-    // Same preliminary access checks getTurnCredentials itself already performs, reused directly
-    // rather than re-implemented -- see getVerifiedCameraClaim's own doc. getTurnCredentials will
-    // independently repeat its own checks immediately before actually vending credentials; this
-    // callable only ever issues a challenge, never TURN credentials.
-    const claim = await getVerifiedCameraClaim(db, cameraDeviceId, authUid);
-    if (claim.access === "not-found") {
-      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "CAMERA_NOT_FOUND" });
-      throw new HttpsError("not-found", "CAMERA_NOT_FOUND");
-    }
-    if (claim.access === "denied") {
-      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "PERMISSION_DENIED" });
-      throw new HttpsError("permission-denied", "PERMISSION_DENIED");
-    }
-
-    // Device-status enforcement on the TARGET camera -- reused exactly as getTurnCredentials
-    // itself already applies it, unmodified. Throws its own already-safe HttpsError directly
-    // (and logs its own DEVICE_OPERATIONAL_CHECK_DENIED event) if the camera is suspended/revoked.
-    await assertRegisteredDeviceOperational(db, cameraDeviceId);
-
-    const entitlements = await getEffectiveUserEntitlements(authUid, db);
-    if (!entitlements.turnAccessAllowed) {
-      logger.info("DEVICE_CHALLENGE_CREATE_DENIED", { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "TURN_ACCESS_DENIED" });
-      throw new HttpsError("permission-denied", "TURN_ACCESS_DENIED");
-    }
-
-    const canonicalRequestPayload = buildCanonicalTurnCredentialsRequestPayload(turnRequestPayload);
+    // --- Shared, purpose-agnostic challenge assembly -- runs exactly once, for every purpose. ---
     const requestHash = sha256Hex(canonicalRequestPayload);
     const nonce = generateChallengeNonce();
     const expiresAt = admin.firestore.Timestamp.fromMillis(Date.now() + CHALLENGE_TTL_SECONDS * 1000);
 
     const challengeRef = db.collection("deviceChallenges").doc();
     const challengeId = challengeRef.id;
-    const devicePurpose: DeviceChallengePurpose = DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS;
+    const devicePurpose: DeviceChallengePurpose = purpose;
 
     const canonicalPayload = buildCanonicalDeviceProofPayload({
       challengeId,
@@ -1900,18 +2074,11 @@ export const createDeviceChallenge = onCall(
         })
       );
     } catch {
-      logger.error("DEVICE_CHALLENGE_CREATE_DENIED", {
-        deviceId,
-        role,
-        purpose,
-        cameraDeviceId,
-        turnPurpose,
-        reason: "CHALLENGE_WRITE_FAILED",
-      });
+      logger.error("DEVICE_CHALLENGE_CREATE_DENIED", writeFailureLogFields);
       throw new HttpsError("internal", "CHALLENGE_CREATE_FAILED");
     }
 
-    logger.info("DEVICE_CHALLENGE_CREATE_SUCCESS", { deviceId, role, purpose, cameraDeviceId, turnPurpose });
+    logger.info("DEVICE_CHALLENGE_CREATE_SUCCESS", successLogFields);
 
     return {
       challengeId,
@@ -1922,6 +2089,13 @@ export const createDeviceChallenge = onCall(
     };
   }
 );
+
+// Live View sessions -- stage 1 of coturn abuse protection. Business logic AND the three callable
+// wrappers themselves both live outside this file (liveViewSessions.ts / liveViewCallables.ts
+// respectively) -- this is intentionally just a thin re-export, matching every other module's own
+// export surface below, so index.ts never grows Live-View-specific request parsing, logging, or
+// error-mapping code of its own. See docs/LIVE_VIEW_SESSIONS.md.
+export { startLiveViewSession, renewLiveViewSession, endLiveViewSession } from "./liveViewCallables";
 
 // Explicit revocation for a lost/stolen device -- a distinct, owner-triggered action, deliberately
 // separate from a normal unpair (releaseCameraForUser/unpairCameraFromDevice/

@@ -1,6 +1,6 @@
 import * as admin from "firebase-admin";
 import * as crypto from "crypto";
-import type { DeviceOperationalReason, DeviceRole, RegisteredDevice } from "./deviceRegistry";
+import type { DeviceOperationalDecision, DeviceOperationalReason, DeviceRole, RegisteredDevice } from "./deviceRegistry";
 import { checkRegisteredDeviceOperational } from "./deviceRegistry";
 import type { EffectiveUserEntitlements } from "./entitlements";
 import { effectiveUserEntitlementsFromData } from "./entitlements";
@@ -25,12 +25,24 @@ import { effectiveUserEntitlementsFromData } from "./entitlements";
 
 export const DEVICE_CHALLENGE_PURPOSES = {
   TURN_CREDENTIALS: "TURN_CREDENTIALS",
+  // Live View session lifecycle (liveViewSessions.ts) -- HOME-only, each bound to a different
+  // canonical request payload (see buildCanonicalLiveViewStartRequestPayload/
+  // buildCanonicalLiveViewSessionIdRequestPayload below): START to a cameraDeviceId (no session
+  // exists yet to bind to), RENEW/END to a sessionId (the specific session being acted on).
+  LIVE_VIEW_START: "LIVE_VIEW_START",
+  LIVE_VIEW_RENEW: "LIVE_VIEW_RENEW",
+  LIVE_VIEW_END: "LIVE_VIEW_END",
 } as const;
 
 export type DeviceChallengePurpose = (typeof DEVICE_CHALLENGE_PURPOSES)[keyof typeof DEVICE_CHALLENGE_PURPOSES];
 
 export function isDeviceChallengePurpose(value: unknown): value is DeviceChallengePurpose {
-  return value === DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS;
+  return (
+    value === DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS ||
+    value === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_START ||
+    value === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_RENEW ||
+    value === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_END
+  );
 }
 
 // Mirrors index.ts's own MAX_DEVICE_ID_LENGTH (128) for registerDevicePublicKey/
@@ -70,7 +82,8 @@ export type RequestPayloadInvalidReason =
   | "MISSING_FIELDS"
   | "UNEXPECTED_FIELDS"
   | "INVALID_CAMERA_DEVICE_ID"
-  | "INVALID_TURN_PURPOSE";
+  | "INVALID_TURN_PURPOSE"
+  | "INVALID_SESSION_ID";
 
 export type TurnCredentialsRequestPayloadValidation =
   | { valid: true; payload: TurnCredentialsChallengeRequestPayload }
@@ -132,6 +145,127 @@ export function buildCanonicalTurnCredentialsRequestPayload(
     `cameraDeviceId=${payload.cameraDeviceId}`,
     `turnPurpose=${payload.turnPurpose}`,
   ].join("\n");
+}
+
+// --- Live View START request payload -- bound to a cameraDeviceId (no session exists yet) --------
+
+export interface LiveViewStartChallengeRequestPayload {
+  cameraDeviceId: string;
+}
+
+export type LiveViewStartRequestPayloadValidation =
+  | { valid: true; payload: LiveViewStartChallengeRequestPayload }
+  | { valid: false; reason: RequestPayloadInvalidReason };
+
+const LIVE_VIEW_START_REQUEST_PAYLOAD_ALLOWED_KEYS = ["cameraDeviceId"] as const;
+
+// Same structure as validateTurnCredentialsRequestPayload -- strict, closed, pure. Deliberately a
+// separate function/type (not a reduced TurnCredentialsChallengeRequestPayload) so this purpose's
+// payload shape can evolve independently and a caller can never accidentally pass a turnPurpose
+// through to a LIVE_VIEW_START challenge.
+export function validateLiveViewStartRequestPayload(payload: unknown): LiveViewStartRequestPayloadValidation {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return { valid: false, reason: "NOT_AN_OBJECT" };
+  }
+
+  const data = payload as Record<string, unknown>;
+  const keys = Object.keys(data);
+
+  if (keys.some((key) => !(LIVE_VIEW_START_REQUEST_PAYLOAD_ALLOWED_KEYS as readonly string[]).includes(key))) {
+    return { valid: false, reason: "UNEXPECTED_FIELDS" };
+  }
+  if (!("cameraDeviceId" in data)) {
+    return { valid: false, reason: "MISSING_FIELDS" };
+  }
+
+  const cameraDeviceId = data.cameraDeviceId;
+  if (
+    typeof cameraDeviceId !== "string" ||
+    cameraDeviceId.trim().length === 0 ||
+    cameraDeviceId.length > MAX_DEVICE_ID_LENGTH
+  ) {
+    return { valid: false, reason: "INVALID_CAMERA_DEVICE_ID" };
+  }
+
+  return { valid: true, payload: { cameraDeviceId } };
+}
+
+export function buildCanonicalLiveViewStartRequestPayload(payload: LiveViewStartChallengeRequestPayload): string {
+  return [
+    REQUEST_PAYLOAD_PROTOCOL_VERSION,
+    `purpose=${DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_START}`,
+    `cameraDeviceId=${payload.cameraDeviceId}`,
+  ].join("\n");
+}
+
+// --- Live View RENEW/END request payload -- both bound to a sessionId -----------------------------
+// Identical shape for both purposes (the `purpose` field itself, embedded separately in the
+// canonical device-proof payload and stored on the challenge document, is what distinguishes a
+// RENEW-scoped signature from an END-scoped one for the exact same sessionId) -- one type/validator
+// shared by both, mirroring how a single TurnCredentialsChallengeRequestPayload already serves all
+// 5 TURN purposes.
+
+export interface LiveViewSessionIdChallengeRequestPayload {
+  sessionId: string;
+}
+
+export type LiveViewSessionIdRequestPayloadValidation =
+  | { valid: true; payload: LiveViewSessionIdChallengeRequestPayload }
+  | { valid: false; reason: RequestPayloadInvalidReason };
+
+const LIVE_VIEW_SESSION_ID_REQUEST_PAYLOAD_ALLOWED_KEYS = ["sessionId"] as const;
+
+// sessionId is always server-generated, exclusively via db.collection("liveViewSessions").doc().id
+// (see liveViewSessions.ts) -- never a client-chosen value. Firestore's own auto-id generator
+// always produces EXACTLY 20 characters from [A-Za-z0-9] -- so this is pinned to that exact
+// length, not a generous upper bound like MAX_CHALLENGE_ID_LENGTH/CHALLENGE_ID_PATTERN below (that
+// pattern accepts arbitrary Admin-SDK-assigned ids of unspecified length; a Live View sessionId's
+// generator is entirely our own choice and its exact shape is fully known and fixed). This is the
+// ONE canonical Live View session-id validator -- used for challenge request validation, the
+// renew/end callables' own request-shape checks, and allocator-entry/canonical-session parsing in
+// liveViewSessions.ts; never a second, separately-maintained pattern anywhere in this feature.
+export const LIVE_VIEW_SESSION_ID_LENGTH = 20;
+const SESSION_ID_PATTERN = /^[A-Za-z0-9]{20}$/;
+
+// Exported so callers that build a Firestore document reference directly from a client-supplied
+// sessionId (index.ts's renewLiveViewSession/endLiveViewSession, and liveViewSessions.ts's own
+// executeRenewLiveViewSession/executeEndLiveViewSession) can validate it BEFORE ever calling
+// db.collection("liveViewSessions").doc(sessionId) -- an unvalidated sessionId containing "/" would
+// otherwise let a caller address an arbitrary nested document path, not just a top-level
+// liveViewSessions/{sessionId} document.
+export function isValidLiveViewSessionIdFormat(sessionId: unknown): sessionId is string {
+  return typeof sessionId === "string" && SESSION_ID_PATTERN.test(sessionId);
+}
+
+export function validateLiveViewSessionIdRequestPayload(
+  payload: unknown
+): LiveViewSessionIdRequestPayloadValidation {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return { valid: false, reason: "NOT_AN_OBJECT" };
+  }
+
+  const data = payload as Record<string, unknown>;
+  const keys = Object.keys(data);
+
+  if (keys.some((key) => !(LIVE_VIEW_SESSION_ID_REQUEST_PAYLOAD_ALLOWED_KEYS as readonly string[]).includes(key))) {
+    return { valid: false, reason: "UNEXPECTED_FIELDS" };
+  }
+  if (!("sessionId" in data)) {
+    return { valid: false, reason: "MISSING_FIELDS" };
+  }
+
+  if (!isValidLiveViewSessionIdFormat(data.sessionId)) {
+    return { valid: false, reason: "INVALID_SESSION_ID" };
+  }
+
+  return { valid: true, payload: { sessionId: data.sessionId } };
+}
+
+export function buildCanonicalLiveViewSessionIdRequestPayload(
+  purpose: typeof DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_RENEW | typeof DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_END,
+  payload: LiveViewSessionIdChallengeRequestPayload
+): string {
+  return [REQUEST_PAYLOAD_PROTOCOL_VERSION, `purpose=${purpose}`, `sessionId=${payload.sessionId}`].join("\n");
 }
 
 // Lowercase hex, 64 characters -- Node's Buffer#digest("hex") is already lowercase, matching this
@@ -455,6 +589,17 @@ export function verifyDeviceProofSignature(
 const CHALLENGE_NONCE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const CHALLENGE_REQUEST_HASH_PATTERN = /^[0-9a-f]{64}$/;
 
+// Exported wrappers around the two patterns above -- reused as-is (never a second, separately
+// maintained copy of either regex) by liveViewSessions.ts's own challenge-invariant verification,
+// which needs the exact same stored-format sanity checks consumeVerifiedTurnCredentialsChallenge
+// applies below but cannot import a module-private const directly.
+export function isValidChallengeNonceFormat(nonce: unknown): nonce is string {
+  return typeof nonce === "string" && CHALLENGE_NONCE_PATTERN.test(nonce);
+}
+export function isValidChallengeRequestHashFormat(hash: unknown): hash is string {
+  return typeof hash === "string" && CHALLENGE_REQUEST_HASH_PATTERN.test(hash);
+}
+
 // Every way consumeVerifiedTurnCredentialsChallenge below can deny a TURN_CREDENTIALS device-proof
 // verification -- deliberately detailed (mirrors DeviceChallengeEligibilityReason's own
 // exhaustiveness) for tests and safe internal logging; index.ts's own error mapping deliberately
@@ -474,6 +619,7 @@ export type TurnCredentialsChallengeVerificationFailureReason =
   | "REQUESTING_DEVICE_NOT_REGISTERED"
   | "REQUESTING_DEVICE_ROLE_MISMATCH"
   | "REQUESTING_DEVICE_AUTH_UID_MISMATCH"
+  | "REQUESTING_DEVICE_OWNER_UID_MISMATCH"
   | "REQUESTING_DEVICE_NOT_PROVISIONED"
   | "REQUESTING_DEVICE_IDENTITY_CORRUPT"
   | "REQUEST_HASH_MISMATCH"
@@ -496,6 +642,214 @@ export type TurnCredentialsChallengeConsumptionOutcome =
   | { outcome: "denied"; reason: TurnCredentialsChallengeVerificationFailureReason };
 
 export const DEVICE_PROOF_VERSION = 1;
+
+// ---------------------------------------------------------------------------------------------
+// verifyDeviceChallengeForConsumption -- the ONE shared, transaction-local device-proof
+// verification primitive. This is the single mechanism that proves "a real, currently-registered,
+// keystore-provisioned device genuinely signed this exact challenge" -- every caller in this
+// project that needs that fact (consumeVerifiedTurnCredentialsChallenge below, and
+// liveViewSessions.ts's executeStartLiveViewSession/executeRenewLiveViewSession/
+// executeEndLiveViewSession) calls this SAME function. There is exactly one signature-verification
+// code path in this codebase -- never a second, parallel one.
+// ---------------------------------------------------------------------------------------------
+// Validates, in order: challenge existence, schemaVersion, challengeId/document-id identity,
+// expected purpose, challenge.authUid === request.auth.uid, usedAt/replay state, expiresAt against
+// server-side `nowMillis` (never a client-supplied clock), nonce format, requestHash format,
+// role (against `expectedRole` if given, else HOME-or-CAMERA), the requesting registeredDevices
+// document's existence/role/authUid/ownerUid(if required)/identityMode/publicKey/operational
+// status, the recomputed canonical request hash (rebuilt from the caller's OWN
+// `canonicalRequestPayload`, never trusted from the stored challenge), the canonical device-proof
+// payload, and finally the P-256 signature itself.
+//
+// Accepts the CALLER's own already-open Firestore transaction (`t`) -- never opens its own. Only
+// performs reads; never writes anything (not even challenge.usedAt/deviceProofVersion) -- every
+// caller decides, only once ALL of its own additional domain-specific checks have also passed,
+// whether to actually consume the challenge and update deviceProofVersion, using the SAME
+// transaction and the `challengeRef`/`requestingDeviceRef`/`requestingDevice` this function
+// returns. This is exactly why "challenge consumption stays inside the same transaction as the
+// protected operation" holds for every caller: there is only ever one transaction, opened once by
+// the caller, and this function never closes over or creates a second one.
+//
+// `expectedRole` (optional): if given, both the challenge's own `role` field and the requesting
+// device's registry `role` must equal it (HOME-only for Live View); if omitted, either HOME or
+// CAMERA is accepted and the actual role is returned (TURN_CREDENTIALS' own existing behavior,
+// unchanged).
+//
+// `requireOwnerUidEqualsAuthUid` (optional, default false): if true, additionally requires
+// `requestingDevice.ownerUid === requestAuthUid` -- Live View's HOME-is-always-self-owned
+// invariant (mirrors claimCameraForUser's own ownership/role audit fix: authUid and ownerUid are
+// checked as two INDEPENDENT fields, never assumed equal, so a corrupted/conflicting document can
+// never be treated as this caller's own device just because one of the two happens to match).
+// TURN_CREDENTIALS never sets this -- Camera's ownerUid is a claim-lifecycle concept unrelated to
+// device identity, and HOME's account-level ownership for TURN is instead proven via
+// cameraClaims.uid (a completely different, domain-specific check performed by
+// consumeVerifiedTurnCredentialsChallenge itself, after this function returns).
+export interface VerifiedDeviceChallenge {
+  verified: true;
+  role: DeviceRole;
+  deviceId: string;
+  requestingDevice: RegisteredDevice;
+  requestingDeviceRef: admin.firestore.DocumentReference;
+  challengeRef: admin.firestore.DocumentReference;
+  nonce: string;
+  expiresAt: admin.firestore.Timestamp;
+  // Computed but NOT enforced by this function -- see its own doc. Callers that must enforce it
+  // (everything except executeEndLiveViewSession) check `operational.operational` themselves.
+  operational: DeviceOperationalDecision;
+}
+export type DeviceChallengeVerificationResult =
+  | VerifiedDeviceChallenge
+  | { verified: false; reason: TurnCredentialsChallengeVerificationFailureReason };
+
+export async function verifyDeviceChallengeForConsumption(
+  t: admin.firestore.Transaction,
+  db: admin.firestore.Firestore,
+  params: {
+    requestAuthUid: string;
+    expectedPurpose: DeviceChallengePurpose;
+    deviceProof: TurnCredentialsDeviceProof;
+    canonicalRequestPayload: string;
+    nowMillis: number;
+    expectedRole?: DeviceRole;
+    requireOwnerUidEqualsAuthUid?: boolean;
+  }
+): Promise<DeviceChallengeVerificationResult> {
+  const { requestAuthUid, expectedPurpose, deviceProof, canonicalRequestPayload, nowMillis, expectedRole, requireOwnerUidEqualsAuthUid } =
+    params;
+  const challengeRef = db.collection("deviceChallenges").doc(deviceProof.challengeId);
+
+  // 1. challenge exists.
+  const challengeSnap = await t.get(challengeRef);
+  if (!challengeSnap.exists) {
+    return { verified: false, reason: "CHALLENGE_NOT_FOUND" };
+  }
+  const challenge = challengeSnap.data() as Record<string, unknown>;
+
+  // 2. schemaVersion == 1.
+  if (challenge.schemaVersion !== DEVICE_CHALLENGE_SCHEMA_VERSION) {
+    return { verified: false, reason: "CHALLENGE_SCHEMA_MISMATCH" };
+  }
+  // 3. document id matches the challengeId field stored inside the document.
+  if (challenge.challengeId !== deviceProof.challengeId) {
+    return { verified: false, reason: "CHALLENGE_ID_MISMATCH" };
+  }
+  // 4. purpose == expectedPurpose.
+  if (challenge.purpose !== expectedPurpose) {
+    return { verified: false, reason: "CHALLENGE_PURPOSE_MISMATCH" };
+  }
+  // 5. authUid == request.auth.uid.
+  const challengeAuthUid = challenge.authUid;
+  if (typeof challengeAuthUid !== "string" || challengeAuthUid !== requestAuthUid) {
+    return { verified: false, reason: "CHALLENGE_AUTH_UID_MISMATCH" };
+  }
+  // 6. usedAt == null.
+  if (challenge.usedAt != null) {
+    return { verified: false, reason: "CHALLENGE_ALREADY_USED" };
+  }
+  // 7. expiresAt > now (server-side nowMillis, never a client-supplied clock).
+  const expiresAt = challenge.expiresAt;
+  if (!(expiresAt instanceof admin.firestore.Timestamp) || expiresAt.toMillis() <= nowMillis) {
+    return { verified: false, reason: "CHALLENGE_EXPIRED" };
+  }
+  // 8. nonce has the expected Base64URL format.
+  const nonce = challenge.nonce;
+  if (!isValidChallengeNonceFormat(nonce)) {
+    return { verified: false, reason: "CHALLENGE_NONCE_MALFORMED" };
+  }
+  // 9. requestHash has the expected 64 lowercase hex chars.
+  const storedRequestHash = challenge.requestHash;
+  if (!isValidChallengeRequestHashFormat(storedRequestHash)) {
+    return { verified: false, reason: "CHALLENGE_REQUEST_HASH_MALFORMED" };
+  }
+  // 10. role is HOME/CAMERA (or exactly expectedRole, if the caller requires one specific role).
+  const challengeRole = challenge.role;
+  if (expectedRole) {
+    if (challengeRole !== expectedRole) {
+      return { verified: false, reason: "CHALLENGE_ROLE_INVALID" };
+    }
+  } else if (challengeRole !== "HOME" && challengeRole !== "CAMERA") {
+    return { verified: false, reason: "CHALLENGE_ROLE_INVALID" };
+  }
+  const role = challengeRole as DeviceRole;
+  const deviceId = challenge.deviceId;
+  if (typeof deviceId !== "string" || deviceId.length === 0) {
+    return { verified: false, reason: "CHALLENGE_SCHEMA_MISMATCH" };
+  }
+
+  // 11. the requesting registered device exists; 12/13/14. its role/authUid/(ownerUid)/identityMode match.
+  const requestingDeviceRef = db.collection("registeredDevices").doc(deviceId);
+  const requestingDeviceSnap = await t.get(requestingDeviceRef);
+  if (!requestingDeviceSnap.exists) {
+    return { verified: false, reason: "REQUESTING_DEVICE_NOT_REGISTERED" };
+  }
+  const requestingDevice = requestingDeviceSnap.data() as RegisteredDevice;
+
+  if (requestingDevice.role !== role) {
+    return { verified: false, reason: "REQUESTING_DEVICE_ROLE_MISMATCH" };
+  }
+  if (requestingDevice.authUid !== requestAuthUid) {
+    return { verified: false, reason: "REQUESTING_DEVICE_AUTH_UID_MISMATCH" };
+  }
+  if (requireOwnerUidEqualsAuthUid && requestingDevice.ownerUid !== requestAuthUid) {
+    return { verified: false, reason: "REQUESTING_DEVICE_OWNER_UID_MISMATCH" };
+  }
+  if (requestingDevice.identityMode !== "keystore") {
+    return { verified: false, reason: "REQUESTING_DEVICE_NOT_PROVISIONED" };
+  }
+  // 14. publicKey exists. Captured into its own const (rather than relying on
+  // `requestingDevice.publicKey` narrowing to persist across the several `await`s below) so its
+  // non-null, non-empty string type is unambiguous at the point it's actually used for
+  // verification further down.
+  const requestingDevicePublicKey = requestingDevice.publicKey;
+  if (!requestingDevicePublicKey) {
+    return { verified: false, reason: "REQUESTING_DEVICE_IDENTITY_CORRUPT" };
+  }
+
+  // 15. requesting device is operational. Unlike every other check here, this ALONE is NOT a hard
+  // verification failure for every caller (executeEndLiveViewSession deliberately never enforces
+  // it -- see its own doc) -- but identity verification (this function) must still always compute
+  // and report the FULL operational decision so a caller that DOES need to enforce it never has to
+  // re-read the device a second time. Callers that must enforce it check `operational.operational`
+  // themselves immediately after a successful call to this function; this function itself never
+  // denies solely for operational status, since doing so would remove that choice from callers
+  // like END that intentionally need to bypass it.
+  const operational = checkRegisteredDeviceOperational(requestingDevice);
+
+  // 16. recomputed requestHash matches -- rebuilt from the ACTUAL request just received (via the
+  // caller's own canonicalRequestPayload, never trusted from the challenge document), so a
+  // cameraDeviceId/turnPurpose/sessionId changed after the challenge was issued is caught here.
+  const recomputedRequestHash = sha256Hex(canonicalRequestPayload);
+  if (recomputedRequestHash !== storedRequestHash) {
+    return { verified: false, reason: "REQUEST_HASH_MISMATCH" };
+  }
+
+  // 17. signature is valid. The canonical device-proof payload is rebuilt entirely server-side
+  // from already-verified, already-read fields -- the client's request never contains (and this
+  // function never trusts) a canonicalPayload string.
+  const canonicalDeviceProofPayload = buildCanonicalDeviceProofPayload({
+    challengeId: deviceProof.challengeId,
+    deviceId,
+    role,
+    purpose: expectedPurpose,
+    authUid: requestAuthUid,
+    nonce,
+    requestHash: storedRequestHash,
+    expiresAtMillis: expiresAt.toMillis(),
+  });
+  const signatureValid = verifyDeviceProofSignature(canonicalDeviceProofPayload, requestingDevicePublicKey, deviceProof.signature);
+  if (!signatureValid) {
+    return { verified: false, reason: "SIGNATURE_INVALID" };
+  }
+
+  // operational is returned, never enforced here -- see this function's own doc (step 15's
+  // comment above) for why: executeEndLiveViewSession must be able to reach a fully "verified"
+  // result for a since-suspended/revoked Home, while consumeVerifiedTurnCredentialsChallenge and
+  // executeStartLiveViewSession/executeRenewLiveViewSession all still enforce it themselves,
+  // immediately after calling this function, exactly as before this refactor -- only the reason
+  // is computed here (once, never a second divergent copy of checkRegisteredDeviceOperational's
+  // own decision), not the enforcement choice.
+  return { verified: true, role, deviceId, requestingDevice, requestingDeviceRef, challengeRef, nonce, expiresAt, operational };
+}
 
 // The single, atomic verify-then-consume operation for a TURN_CREDENTIALS device proof --
 // implements the full check sequence documented on index.ts's getTurnCredentials, all inside ONE
@@ -526,102 +880,27 @@ export async function consumeVerifiedTurnCredentialsChallenge(
   }
 ): Promise<TurnCredentialsChallengeConsumptionOutcome> {
   const { requestAuthUid, cameraDeviceId, turnPurpose, deviceProof, nowMillis } = params;
-  const challengeRef = db.collection("deviceChallenges").doc(deviceProof.challengeId);
 
   return db.runTransaction(async (t): Promise<TurnCredentialsChallengeConsumptionOutcome> => {
-    // 1. challenge exists.
-    const challengeSnap = await t.get(challengeRef);
-    if (!challengeSnap.exists) {
-      return { outcome: "denied", reason: "CHALLENGE_NOT_FOUND" };
+    // Steps 1-16 (challenge validity, requesting-device identity/eligibility, recomputed
+    // requestHash) and the signature itself are ALL delegated to the one shared, transaction-local
+    // verification primitive -- see its own doc for exactly what it checks and why. Operational
+    // status (step 15) is returned, not enforced by the primitive -- enforced here explicitly,
+    // immediately below, exactly where it always was.
+    const verification = await verifyDeviceChallengeForConsumption(t, db, {
+      requestAuthUid,
+      expectedPurpose: DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS,
+      deviceProof,
+      canonicalRequestPayload: buildCanonicalTurnCredentialsRequestPayload({ cameraDeviceId, turnPurpose }),
+      nowMillis,
+    });
+    if (!verification.verified) {
+      return { outcome: "denied", reason: verification.reason };
     }
-    const challenge = challengeSnap.data() as Record<string, unknown>;
+    const { role, deviceId, requestingDevice, requestingDeviceRef, challengeRef, operational } = verification;
 
-    // 2. schemaVersion == 1.
-    if (challenge.schemaVersion !== DEVICE_CHALLENGE_SCHEMA_VERSION) {
-      return { outcome: "denied", reason: "CHALLENGE_SCHEMA_MISMATCH" };
-    }
-    // 3. document id matches the challengeId field stored inside the document.
-    if (challenge.challengeId !== deviceProof.challengeId) {
-      return { outcome: "denied", reason: "CHALLENGE_ID_MISMATCH" };
-    }
-    // 4. purpose == TURN_CREDENTIALS.
-    if (challenge.purpose !== DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS) {
-      return { outcome: "denied", reason: "CHALLENGE_PURPOSE_MISMATCH" };
-    }
-    // 5. authUid == request.auth.uid.
-    const challengeAuthUid = challenge.authUid;
-    if (typeof challengeAuthUid !== "string" || challengeAuthUid !== requestAuthUid) {
-      return { outcome: "denied", reason: "CHALLENGE_AUTH_UID_MISMATCH" };
-    }
-    // 6. usedAt == null.
-    if (challenge.usedAt != null) {
-      return { outcome: "denied", reason: "CHALLENGE_ALREADY_USED" };
-    }
-    // 7. expiresAt > now.
-    const expiresAt = challenge.expiresAt;
-    if (!(expiresAt instanceof admin.firestore.Timestamp) || expiresAt.toMillis() <= nowMillis) {
-      return { outcome: "denied", reason: "CHALLENGE_EXPIRED" };
-    }
-    // 8. nonce has the expected Base64URL format.
-    const nonce = challenge.nonce;
-    if (typeof nonce !== "string" || !CHALLENGE_NONCE_PATTERN.test(nonce)) {
-      return { outcome: "denied", reason: "CHALLENGE_NONCE_MALFORMED" };
-    }
-    // 9. requestHash has the expected 64 lowercase hex chars.
-    const storedRequestHash = challenge.requestHash;
-    if (typeof storedRequestHash !== "string" || !CHALLENGE_REQUEST_HASH_PATTERN.test(storedRequestHash)) {
-      return { outcome: "denied", reason: "CHALLENGE_REQUEST_HASH_MALFORMED" };
-    }
-    // 10. role is HOME or CAMERA.
-    const role = challenge.role;
-    if (role !== "HOME" && role !== "CAMERA") {
-      return { outcome: "denied", reason: "CHALLENGE_ROLE_INVALID" };
-    }
-    const deviceId = challenge.deviceId;
-    if (typeof deviceId !== "string" || deviceId.length === 0) {
-      return { outcome: "denied", reason: "CHALLENGE_SCHEMA_MISMATCH" };
-    }
-
-    // 11. the requesting registered device exists; 12/13/14. its role/authUid/identityMode match.
-    const requestingDeviceRef = db.collection("registeredDevices").doc(deviceId);
-    const requestingDeviceSnap = await t.get(requestingDeviceRef);
-    if (!requestingDeviceSnap.exists) {
-      return { outcome: "denied", reason: "REQUESTING_DEVICE_NOT_REGISTERED" };
-    }
-    const requestingDevice = requestingDeviceSnap.data() as RegisteredDevice;
-
-    if (requestingDevice.role !== role) {
-      return { outcome: "denied", reason: "REQUESTING_DEVICE_ROLE_MISMATCH" };
-    }
-    if (requestingDevice.authUid !== requestAuthUid) {
-      return { outcome: "denied", reason: "REQUESTING_DEVICE_AUTH_UID_MISMATCH" };
-    }
-    if (requestingDevice.identityMode !== "keystore") {
-      return { outcome: "denied", reason: "REQUESTING_DEVICE_NOT_PROVISIONED" };
-    }
-    // 14. publicKey exists. Captured into its own const (rather than relying on
-    // `requestingDevice.publicKey` narrowing to persist across the several `await`s below) so its
-    // non-null, non-empty string type is unambiguous at the point it's actually used for
-    // verification further down.
-    const requestingDevicePublicKey = requestingDevice.publicKey;
-    if (!requestingDevicePublicKey) {
-      return { outcome: "denied", reason: "REQUESTING_DEVICE_IDENTITY_CORRUPT" };
-    }
-
-    // 15. requesting device is operational.
-    const requestingOperational = checkRegisteredDeviceOperational(requestingDevice);
-    if (!requestingOperational.operational) {
-      return { outcome: "denied", reason: requestingOperational.reason };
-    }
-
-    // 16. recomputed requestHash matches -- rebuilt from the ACTUAL request just received (not
-    // trusted from the challenge document), so a cameraDeviceId or turnPurpose changed after the
-    // challenge was issued is caught here.
-    const recomputedRequestHash = sha256Hex(
-      buildCanonicalTurnCredentialsRequestPayload({ cameraDeviceId, turnPurpose })
-    );
-    if (recomputedRequestHash !== storedRequestHash) {
-      return { outcome: "denied", reason: "REQUEST_HASH_MISMATCH" };
+    if (!operational.operational) {
+      return { outcome: "denied", reason: operational.reason };
     }
 
     // Role-specific: a CAMERA may only ever sign a challenge about itself.
@@ -677,32 +956,6 @@ export async function consumeVerifiedTurnCredentialsChallenge(
     );
     if (!effectiveEntitlements.turnAccessAllowed) {
       return { outcome: "denied", reason: "TURN_ACCESS_DENIED" };
-    }
-
-    // 20. signature is valid -- the last check that can be decided from data already read above;
-    // deliberately checked before the HOME-device-link lookup just below, so an invalid signature
-    // (proof of possession never established) is denied without ever performing that lookup --
-    // whatever it might reveal about this camera's pairing stays unreached for a request that
-    // never proved which key it was signed with. The canonical device-proof payload is rebuilt
-    // entirely server-side from already-verified, already-read fields -- the client's request
-    // never contains (and this function never trusts) a canonicalPayload string.
-    const canonicalDeviceProofPayload = buildCanonicalDeviceProofPayload({
-      challengeId: deviceProof.challengeId,
-      deviceId,
-      role,
-      purpose: DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS,
-      authUid: requestAuthUid,
-      nonce,
-      requestHash: storedRequestHash,
-      expiresAtMillis: expiresAt.toMillis(),
-    });
-    const signatureValid = verifyDeviceProofSignature(
-      canonicalDeviceProofPayload,
-      requestingDevicePublicKey,
-      deviceProof.signature
-    );
-    if (!signatureValid) {
-      return { outcome: "denied", reason: "SIGNATURE_INVALID" };
     }
 
     // 21. HOME-specific device-level authorization. Step 17 above (cameraClaims.uid ===
