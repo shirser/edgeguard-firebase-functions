@@ -62,6 +62,16 @@ service cloud.firestore {
       return expiresAt is timestamp && expiresAt > request.time;
     }
 
+    // The Stage-1 liveViewSessions/{sessionId} id (a completely different collection/id space from
+    // this webrtcSessions doc's own {sessionId}) -- LIVE_VIEW-only, published here purely so Camera
+    // has a channel to learn it (see LiveViewSessionInitiator.buildLiveViewSessionData's own doc in
+    // edgeguard-home-android). Same exact format as the backend's own canonical validator
+    // (functions/src/deviceChallenges.ts: LIVE_VIEW_SESSION_ID_LENGTH = 20, Firestore auto-id
+    // charset) -- kept in sync with that pattern, not re-derived independently.
+    function isValidLiveViewSessionId(liveViewSessionId) {
+      return liveViewSessionId is string && liveViewSessionId.matches('^[A-Za-z0-9]{20}$');
+    }
+
     // A single ICE candidate line is well under a few hundred bytes in
     // practice; 2000 chars bounds it far above real-world size without
     // allowing an arbitrary payload.
@@ -289,7 +299,7 @@ service cloud.firestore {
           request.resource.data.keys().hasOnly([
             "cameraDeviceId", "homeDeviceId", "createdBy", "purpose", "status",
             "offerSdp", "offerType", "answerSdp", "answerType",
-            "createdAt", "updatedAt", "expiresAt"
+            "createdAt", "updatedAt", "expiresAt", "liveViewSessionId"
           ]) &&
           request.resource.data.cameraDeviceId == cameraDeviceId &&
           request.resource.data.homeDeviceId is string &&
@@ -302,7 +312,13 @@ service cloud.firestore {
           request.resource.data.answerType == null &&
           request.resource.data.createdAt is timestamp &&
           request.resource.data.updatedAt is timestamp &&
-          isValidExpiresAt(request.resource.data.expiresAt);
+          isValidExpiresAt(request.resource.data.expiresAt) &&
+          // LIVE_VIEW must carry a well-formed Stage-1 id (Camera has no other way to learn it);
+          // every other purpose must NOT carry this field at all -- strict, closed either way,
+          // never merely "allowed but unchecked" for either branch.
+          (request.resource.data.purpose == "LIVE_VIEW" ?
+            isValidLiveViewSessionId(request.resource.data.liveViewSessionId) :
+            !("liveViewSessionId" in request.resource.data));
 
         // Home may only advance status and attach its own offer; the
         // answer fields and every identity/purpose field stay untouched.

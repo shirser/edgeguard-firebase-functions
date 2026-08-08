@@ -564,6 +564,57 @@ describe("webrtcSessions: Home (linked)", () => {
     );
   });
 
+  // --- LIVE_VIEW: liveViewSessionId (Stage-1 correlation field) -------------------------------
+  // This is the ONLY channel Camera has to learn the Stage-1 liveViewSessions/{sessionId} id (see
+  // LiveViewSessionInitiator.buildLiveViewSessionData's own doc, edgeguard-home-android) -- these
+  // tests exist specifically because a rules regression here would either silently break every
+  // Live View call (id never reaches Camera) or, worse, let a malformed/spoofed value through.
+
+  it("creates a LIVE_VIEW session with a valid liveViewSessionId", async () => {
+    await assertSucceeds(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "LIVE_VIEW", liveViewSessionId: "abcDEF0123abcDEF0123" })
+      )
+    );
+  });
+
+  it("cannot create a LIVE_VIEW session without a liveViewSessionId", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "LIVE_VIEW" })
+      )
+    );
+  });
+
+  it("cannot create a LIVE_VIEW session with a malformed liveViewSessionId (wrong length)", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "LIVE_VIEW", liveViewSessionId: "too-short" })
+      )
+    );
+  });
+
+  it("cannot create a LIVE_VIEW session with a liveViewSessionId containing invalid characters", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "LIVE_VIEW", liveViewSessionId: "abcDEF0123-abcDEF012" })
+      )
+    );
+  });
+
+  it("cannot create a non-LIVE_VIEW session carrying a liveViewSessionId", async () => {
+    await assertFails(
+      setDoc(
+        doc(homeDb(testEnv), "cameraLinks", CAMERA_ID, "webrtcSessions", "s1"),
+        validSession({ purpose: "PLACEMENT_IMAGE", liveViewSessionId: "abcDEF0123abcDEF0123" })
+      )
+    );
+  });
+
   it("attaches its own offer and advances status", async () => {
     await seedDoc(testEnv, ["cameraLinks", CAMERA_ID, "webrtcSessions", "s1"], validSession());
     await assertSucceeds(
