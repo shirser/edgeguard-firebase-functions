@@ -32,6 +32,16 @@ export const DEVICE_CHALLENGE_PURPOSES = {
   LIVE_VIEW_START: "LIVE_VIEW_START",
   LIVE_VIEW_RENEW: "LIVE_VIEW_RENEW",
   LIVE_VIEW_END: "LIVE_VIEW_END",
+  // getTurnAuthorizationGrant (turnAuthorizationGrant.ts) -- HOME-only, bound to a sessionId exactly
+  // like LIVE_VIEW_RENEW/LIVE_VIEW_END. Restores the same device-binding guarantee START/RENEW/END
+  // already establish -- without this, "authenticated as the account that owns this session" (the
+  // Firebase uid) is NOT the same fact as "is the specific Home installation this session is bound
+  // to": the same Google account can be signed into more than one Home installation, each with its
+  // own registeredDevices document and Keystore key (see liveViewSessions.ts's own
+  // HOME_CAMERA_LINK_MISMATCH doc), so a second, unrelated Home installation under the same account
+  // could otherwise request a grant for a session it never started. See turnAuthorizationGrant.ts's
+  // own doc for the full rationale and why CAMERA does not need an equivalent purpose.
+  LIVE_VIEW_TURN_GRANT: "LIVE_VIEW_TURN_GRANT",
 } as const;
 
 export type DeviceChallengePurpose = (typeof DEVICE_CHALLENGE_PURPOSES)[keyof typeof DEVICE_CHALLENGE_PURPOSES];
@@ -41,7 +51,8 @@ export function isDeviceChallengePurpose(value: unknown): value is DeviceChallen
     value === DEVICE_CHALLENGE_PURPOSES.TURN_CREDENTIALS ||
     value === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_START ||
     value === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_RENEW ||
-    value === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_END
+    value === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_END ||
+    value === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_TURN_GRANT
   );
 }
 
@@ -198,12 +209,12 @@ export function buildCanonicalLiveViewStartRequestPayload(payload: LiveViewStart
   ].join("\n");
 }
 
-// --- Live View RENEW/END request payload -- both bound to a sessionId -----------------------------
-// Identical shape for both purposes (the `purpose` field itself, embedded separately in the
+// --- Live View RENEW/END/TURN_GRANT request payload -- all three bound to a sessionId -------------
+// Identical shape for all three purposes (the `purpose` field itself, embedded separately in the
 // canonical device-proof payload and stored on the challenge document, is what distinguishes a
-// RENEW-scoped signature from an END-scoped one for the exact same sessionId) -- one type/validator
-// shared by both, mirroring how a single TurnCredentialsChallengeRequestPayload already serves all
-// 5 TURN purposes.
+// RENEW-scoped signature from an END- or TURN_GRANT-scoped one for the exact same sessionId) -- one
+// type/validator shared by all three, mirroring how a single TurnCredentialsChallengeRequestPayload
+// already serves all 5 TURN purposes.
 
 export interface LiveViewSessionIdChallengeRequestPayload {
   sessionId: string;
@@ -262,7 +273,10 @@ export function validateLiveViewSessionIdRequestPayload(
 }
 
 export function buildCanonicalLiveViewSessionIdRequestPayload(
-  purpose: typeof DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_RENEW | typeof DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_END,
+  purpose:
+    | typeof DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_RENEW
+    | typeof DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_END
+    | typeof DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_TURN_GRANT,
   payload: LiveViewSessionIdChallengeRequestPayload
 ): string {
   return [REQUEST_PAYLOAD_PROTOCOL_VERSION, `purpose=${purpose}`, `sessionId=${payload.sessionId}`].join("\n");

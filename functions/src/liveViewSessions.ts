@@ -259,7 +259,7 @@ export function parseLiveViewSession(sessionId: string, data: FirebaseFirestore.
 // from allocator-based counting while remaining ACTIVE, enabling a maxConcurrentLiveSessions bypass.
 // ---------------------------------------------------------------------------------------------
 
-type AllocatorParseResult =
+export type AllocatorParseResult =
   | { valid: true; activeSessions: Record<string, LiveViewUserStateActiveEntry> }
   | { valid: false; alreadyMarkedCorrupt: boolean };
 
@@ -272,7 +272,7 @@ const ALLOCATOR_ALLOWED_KEYS = [
   "activeSessions",
 ] as const;
 
-function parseAllocatorState(data: FirebaseFirestore.DocumentData | undefined): AllocatorParseResult {
+export function parseAllocatorState(data: FirebaseFirestore.DocumentData | undefined): AllocatorParseResult {
   if (!data) {
     return { valid: true, activeSessions: Object.create(null) as Record<string, LiveViewUserStateActiveEntry> };
   }

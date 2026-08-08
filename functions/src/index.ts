@@ -181,10 +181,12 @@ export type {
   LiveViewUserState,
   LiveViewSessionDenialReason,
   SessionParseResult,
+  AllocatorParseResult,
   StartLiveViewSessionOutcome,
   RenewLiveViewSessionOutcome,
   EndLiveViewSessionOutcome,
 } from "./liveViewSessions";
+export { parseAllocatorState } from "./liveViewSessions";
 
 function hashSecret(secret: string): string {
   return crypto.createHash("sha256").update(secret).digest("hex");
@@ -1940,14 +1942,18 @@ export const createDeviceChallenge = onCall(
       successLogFields = { deviceId, role, purpose, cameraDeviceId, turnPurpose };
       writeFailureLogFields = { deviceId, role, purpose, cameraDeviceId, turnPurpose, reason: "CHALLENGE_WRITE_FAILED" };
     } else {
-      // LIVE_VIEW_START / LIVE_VIEW_RENEW / LIVE_VIEW_END (liveViewSessions.ts) -- HOME-only.
-      // Deliberately does NOT verify Camera ownership, the Home<->Camera link, or entitlements
-      // here: those decisions can only ever be made correctly atomically with the actual
-      // start/renew/end transaction (see liveViewSessions.ts's own doc) -- pre-checking them here
-      // too would be a second, non-atomic, potentially-divergent copy of that same authorization
-      // logic. This callable's only job for these purposes is: is the requesting device a real,
-      // operational, keystore-provisioned HOME device, and does its request payload have the right
-      // shape -- the same device-eligibility bar every purpose already enforces.
+      // LIVE_VIEW_START / LIVE_VIEW_RENEW / LIVE_VIEW_END (liveViewSessions.ts) and
+      // LIVE_VIEW_TURN_GRANT (turnAuthorizationGrant.ts) -- all four HOME-only. LIVE_VIEW_TURN_GRANT
+      // shares the exact sessionId-based request/canonicalization path RENEW/END already use below
+      // (validateLiveViewSessionIdRequestPayload / buildCanonicalLiveViewSessionIdRequestPayload) --
+      // it is not given its own branch. Deliberately does NOT verify Camera ownership, the
+      // Home<->Camera link, or entitlements here: those decisions can only ever be made correctly
+      // atomically with the actual start/renew/end/grant transaction (see liveViewSessions.ts's and
+      // turnAuthorizationGrant.ts's own docs) -- pre-checking them here too would be a second,
+      // non-atomic, potentially-divergent copy of that same authorization logic. This callable's
+      // only job for these purposes is: is the requesting device a real, operational,
+      // keystore-provisioned HOME device, and does its request payload have the right shape -- the
+      // same device-eligibility bar every purpose already enforces.
       let liveViewCanonicalPayload: string;
       if (purpose === DEVICE_CHALLENGE_PURPOSES.LIVE_VIEW_START) {
         const payloadValidation = validateLiveViewStartRequestPayload(requestPayload);
@@ -2096,6 +2102,22 @@ export const createDeviceChallenge = onCall(
 // export surface below, so index.ts never grows Live-View-specific request parsing, logging, or
 // error-mapping code of its own. See docs/LIVE_VIEW_SESSIONS.md.
 export { startLiveViewSession, renewLiveViewSession, endLiveViewSession } from "./liveViewCallables";
+
+// TURN authorization grant -- the Firebase-side half of the VPS TURN Auth API design (see
+// docs/COTURN_AUDIT.md). Same thin re-export pattern as the three Live View session callables
+// immediately above -- business logic and the callable wrapper both live in
+// turnAuthorizationGrant.ts, never here.
+export {
+  getTurnAuthorizationGrant,
+  signTurnAuthorizationGrant,
+  verifyTurnAuthorizationGrant,
+  TURN_GRANT_TTL_SECONDS,
+} from "./turnAuthorizationGrant";
+export type {
+  TurnAuthorizationGrantRole,
+  TurnAuthorizationGrantPayload,
+  TurnAuthorizationGrantVerification,
+} from "./turnAuthorizationGrant";
 
 // Explicit revocation for a lost/stolen device -- a distinct, owner-triggered action, deliberately
 // separate from a normal unpair (releaseCameraForUser/unpairCameraFromDevice/
